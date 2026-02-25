@@ -9,14 +9,15 @@ import (
 )
 
 var (
-	ErrMalformedWeave = errors.New("malformed weave")
+	ErrBadWeave = errors.New("E001: malformed weave")
+	ErrBadDelta = errors.New("E002: bad delta")
 )
 
 type Action int
 
 const (
-	Add Action = iota
-	Del
+	Insert Action = iota
+	Delete
 	Keep
 )
 
@@ -66,6 +67,15 @@ func (i Instruction) String() string {
 		return fmt.Sprintf("^AE %d", i.Payload)
 	}
 	return "unknown"
+}
+
+func FormatWeave(weave []Instruction) string {
+	var buf strings.Builder
+	for _, instr := range weave {
+		buf.WriteString(instr.String())
+		buf.WriteRune('\n')
+	}
+	return buf.String()
 }
 
 type VersionID int
@@ -134,13 +144,15 @@ func (q *instructionQueue) Len() int {
 func (q *instructionQueue) closeInstr(v VersionID) (Instruction, error) {
 	i := slices.IndexFunc(q.entries, func(e Instruction) bool { return e.VersionID() == v })
 	if i == -1 {
-		return Instruction{}, ErrMalformedWeave
+		return Instruction{}, ErrBadWeave
 	}
 	return heap.Remove(q, i).(Instruction), nil
 }
 
 // Reconstruct locates the lines that belong to the given version.
 // It returns a mask that marks the "Line" instructions enabled for the given version.
+//
+// Returns the [ErrBadWeave] if the instructions aren't a valid weave.
 func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]bool, error) {
 	mask := make([]bool, len(instructions))
 	activeSet := NewQueue(g)
@@ -149,7 +161,7 @@ func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]boo
 		switch instr.Type {
 		case InstrLine:
 			if activeSet.Len() == 0 {
-				return nil, fmt.Errorf("%w: bare line instruction on line %d", ErrMalformedWeave, i)
+				return nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
 			}
 			top := activeSet.entries[0]
 			if g.IsAncestorOf(top.VersionID(), v) && top.Type == InstrBeginAdd {
@@ -173,6 +185,74 @@ func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]boo
 		}
 	}
 	return mask, nil
+}
+
+// Interleave extends a weave with a new delta.
+//
+// Returns [ErrBadWeave] if the instructions aren't a valid weave.
+// Returns [ErrBadDelta] if the deltas don't apply to the weave cleanly.
+func Interleave(instructions []Instruction, g VersionGraph, deltas []Delta, baseV, newV VersionID) ([]Instruction, error) {
+	mask, err := Reconstruct(instructions, g, baseV)
+	if err != nil {
+		return nil, err
+	}
+	var out []Instruction
+	i, j, n, m := 0, 0, len(instructions), len(deltas)
+	for i < n || j < m {
+		// Advance to the next activated line.
+		for i < n && !mask[i] {
+			out = append(out, instructions[i])
+			i++
+		}
+		if j < m {
+			delta := deltas[j]
+			switch delta.Action {
+			case Insert:
+				out = append(out, Instruction{InstrBeginAdd, int(newV)})
+				for _, item := range delta.Items {
+					out = append(out, Instruction{InstrLine, item})
+				}
+				out = append(out, Instruction{InstrEnd, int(newV)})
+			case Delete:
+				out = append(out, Instruction{InstrBeginDel, int(newV)})
+				skipped := 0
+				for skipped < len(delta.Items) {
+					if i >= n {
+						return nil, fmt.Errorf("%w: bad deletion at %d", ErrBadDelta, j)
+					}
+					out = append(out, instructions[i])
+					if mask[i] {
+						if delta.Items[skipped] != instructions[i].Line() {
+							return nil, fmt.Errorf("%w: mismatched line %d in hunk %d", ErrBadDelta, skipped+1, j+1)
+						}
+						skipped++
+					}
+					i++
+				}
+				out = append(out, Instruction{InstrEnd, int(newV)})
+			case Keep:
+				skipped := 0
+				for skipped < len(delta.Items) {
+					if i >= n {
+						return nil, ErrBadDelta
+					}
+					out = append(out, instructions[i])
+					if mask[i] {
+						if delta.Items[skipped] != instructions[i].Line() {
+							return nil, fmt.Errorf("%w: mismatched line %d in hunk %d", ErrBadDelta, skipped+1, j+1)
+						}
+						skipped++
+					}
+					i++
+				}
+			}
+			j++
+		} else if i < n {
+			return nil, fmt.Errorf("%w: delta does not cover all lines in base version %d", ErrBadDelta, baseV)
+		}
+
+	}
+	return out, nil
 }
 
 type Table struct {
@@ -209,9 +289,9 @@ func FormatScript(script []Delta) string {
 	for _, delta := range script {
 		marker := ' '
 		switch delta.Action {
-		case Del:
+		case Delete:
 			marker = '-'
-		case Add:
+		case Insert:
 			marker = '+'
 		}
 		for _, item := range delta.Items {
@@ -261,13 +341,13 @@ func DiffScript(a, b []int) []Delta {
 		}
 		if i < n && d.At(i+1, j) < v {
 			v = d.At(i+1, j)
-			delta.Action = Del
+			delta.Action = Delete
 			delta.Items = []int{a[i]}
 			dx, dy = 1, 0
 		}
 		if j < m && d.At(i, j+1) < v {
 			v = d.At(i, j+1)
-			delta.Action = Add
+			delta.Action = Insert
 			delta.Items = []int{b[j]}
 			dx, dy = 0, 1
 		}
