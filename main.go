@@ -26,13 +26,17 @@ type Delta struct {
 	Items  []int
 }
 
+func EqualDeltas(x, y Delta) bool {
+	return x.Action == y.Action && slices.Equal(x.Items, y.Items)
+}
+
 type InstructionType int
 
 const (
 	InstrUnknown InstructionType = iota
 	InstrLine
-	InstrBeginAdd
-	InstrBeginDel
+	InstrBeginInsert
+	InstrBeginDelete
 	InstrEnd
 )
 
@@ -59,9 +63,9 @@ func (i Instruction) String() string {
 	switch i.Type {
 	case InstrLine:
 		return fmt.Sprintf("%d", i.Payload)
-	case InstrBeginAdd:
+	case InstrBeginInsert:
 		return fmt.Sprintf("^AI %d", i.Payload)
-	case InstrBeginDel:
+	case InstrBeginDelete:
 		return fmt.Sprintf("^AD %d", i.Payload)
 	case InstrEnd:
 		return fmt.Sprintf("^AE %d", i.Payload)
@@ -166,13 +170,13 @@ func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]boo
 				return nil, nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
 			}
 			top := activeSet.entries[0]
-			if g.IsAncestorOf(top.VersionID(), v) && top.Type == InstrBeginAdd {
+			if g.IsAncestorOf(top.VersionID(), v) && top.Type == InstrBeginInsert {
 				mask[i] = true
 				versions = append(versions, top.VersionID())
 			}
-		case InstrBeginAdd:
+		case InstrBeginInsert:
 			heap.Push(activeSet, instr)
-		case InstrBeginDel:
+		case InstrBeginDelete:
 			if g.IsAncestorOf(instr.VersionID(), v) {
 				heap.Push(activeSet, instr)
 			} else {
@@ -211,13 +215,13 @@ func Interleave(instructions []Instruction, g VersionGraph, deltas []Delta, base
 			delta := deltas[j]
 			switch delta.Action {
 			case Insert:
-				out = append(out, Instruction{InstrBeginAdd, int(newV)})
+				out = append(out, Instruction{InstrBeginInsert, int(newV)})
 				for _, item := range delta.Items {
 					out = append(out, Instruction{InstrLine, item})
 				}
 				out = append(out, Instruction{InstrEnd, int(newV)})
 			case Delete:
-				out = append(out, Instruction{InstrBeginDel, int(newV)})
+				out = append(out, Instruction{InstrBeginDelete, int(newV)})
 				skipped := 0
 				for skipped < len(delta.Items) {
 					if i >= n {
@@ -256,6 +260,65 @@ func Interleave(instructions []Instruction, g VersionGraph, deltas []Delta, base
 
 	}
 	return out, nil
+}
+
+// ReconstructDelta extracts from a weave the changes introduced by the specified version.
+func ReconstructDelta(instructions []Instruction, g VersionGraph, v VersionID) ([]Delta, error) {
+	var deltas []Delta
+	delta := Delta{Action: Keep, Items: nil}
+	activeSet := NewQueue(g)
+	inactiveSet := NewQueue(g)
+
+	for i, instr := range instructions {
+		switch instr.Type {
+		case InstrLine:
+			if activeSet.Len() == 0 {
+				return nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
+			}
+			top := activeSet.entries[0]
+			if top.VersionID() == v || g.IsAncestorOf(top.VersionID(), v) && top.Type == InstrBeginInsert {
+				delta.Items = append(delta.Items, instr.Line())
+			}
+		case InstrBeginInsert:
+			heap.Push(activeSet, instr)
+			if instr.VersionID() == v {
+				if len(delta.Items) > 0 {
+					deltas = append(deltas, delta)
+				}
+				delta.Action = Insert
+				delta.Items = nil
+			}
+		case InstrBeginDelete:
+			if instr.VersionID() == v {
+				if len(delta.Items) > 0 {
+					deltas = append(deltas, delta)
+				}
+				delta.Action = Delete
+				delta.Items = nil
+			}
+			if g.IsAncestorOf(instr.VersionID(), v) {
+				heap.Push(activeSet, instr)
+			} else {
+				heap.Push(inactiveSet, instr)
+			}
+		case InstrEnd:
+			top, err := activeSet.closeInstr(instr.VersionID())
+			if top.VersionID() == v && len(delta.Items) > 0 {
+				deltas = append(deltas, delta)
+				delta.Action = Keep
+				delta.Items = nil
+			}
+			if err != nil {
+				if _, err := inactiveSet.closeInstr(instr.VersionID()); err != nil {
+					return nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
+				}
+			}
+		}
+	}
+	if len(delta.Items) > 0 {
+		deltas = append(deltas, delta)
+	}
+	return deltas, nil
 }
 
 type Table struct {

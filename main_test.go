@@ -113,9 +113,9 @@ func checkReconstruct(t *testing.T, spec string, v VersionID) {
 			var instr Instruction
 			instr.Payload = p
 			if cmd == "^AI" {
-				instr.Type = InstrBeginAdd
+				instr.Type = InstrBeginInsert
 			} else if cmd == "^AD" {
-				instr.Type = InstrBeginDel
+				instr.Type = InstrBeginDelete
 			} else if cmd == "^AE" {
 				instr.Type = InstrEnd
 			} else {
@@ -256,9 +256,9 @@ func parseWeave(s string) ([]Instruction, error) {
 		var instr Instruction
 		instr.Payload = payload
 		if cmd == "^AI" {
-			instr.Type = InstrBeginAdd
+			instr.Type = InstrBeginInsert
 		} else if cmd == "^AD" {
-			instr.Type = InstrBeginDel
+			instr.Type = InstrBeginDelete
 		} else if cmd == "^AE" {
 			instr.Type = InstrEnd
 		} else {
@@ -282,13 +282,19 @@ func checkInterleave(t *testing.T, baseStr, deltasStr, resultStr string, baseV, 
 	if err != nil {
 		t.Fatalf("failed to parse result weave: %s", err)
 	}
+	var g VersionGraph
 
-	interleaved, err := Interleave(baseW, VersionGraph{}, deltas, VersionID(baseV), VersionID(newV))
+	interleaved, err := Interleave(baseW, g, deltas, VersionID(baseV), VersionID(newV))
 	if err != nil {
 		t.Fatalf("interleave failed: %s", err)
 	}
 	if !slices.Equal(resultW, interleaved) {
 		t.Fatalf("Expected:\n%sGot:\n%s", FormatWeave(resultW), FormatWeave(interleaved))
+	}
+
+	reconstructedDelta, err := ReconstructDelta(resultW, g, VersionID(newV))
+	if !slices.EqualFunc(reconstructedDelta, deltas, EqualDeltas) {
+		t.Fatalf("delta reconstruction failed:\nExpected:\n%sGot:\n%s", FormatScript(deltas), FormatScript(reconstructedDelta))
 	}
 }
 
