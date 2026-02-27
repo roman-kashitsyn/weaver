@@ -150,22 +150,25 @@ func (q *instructionQueue) closeInstr(v VersionID) (Instruction, error) {
 }
 
 // Reconstruct locates the lines that belong to the given version.
-// It returns a mask that marks the "Line" instructions enabled for the given version.
+// It returns a mask that marks the "Line" instructions enabled for the given version
+// and the IDs of versions to which the enabled lines are attributed.
 //
 // Returns the [ErrBadWeave] if the instructions aren't a valid weave.
-func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]bool, error) {
+func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]bool, []VersionID, error) {
 	mask := make([]bool, len(instructions))
+	var versions []VersionID
 	activeSet := NewQueue(g)
 	inactiveSet := NewQueue(g)
 	for i, instr := range instructions {
 		switch instr.Type {
 		case InstrLine:
 			if activeSet.Len() == 0 {
-				return nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
+				return nil, nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
 			}
 			top := activeSet.entries[0]
 			if g.IsAncestorOf(top.VersionID(), v) && top.Type == InstrBeginAdd {
 				mask[i] = true
+				versions = append(versions, top.VersionID())
 			}
 		case InstrBeginAdd:
 			heap.Push(activeSet, instr)
@@ -179,12 +182,12 @@ func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]boo
 			_, err := activeSet.closeInstr(instr.VersionID())
 			if err != nil {
 				if _, err := inactiveSet.closeInstr(instr.VersionID()); err != nil {
-					return nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
+					return nil, nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
 				}
 			}
 		}
 	}
-	return mask, nil
+	return mask, versions, nil
 }
 
 // Interleave extends a weave with a new delta.
@@ -192,7 +195,7 @@ func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]boo
 // Returns [ErrBadWeave] if the instructions aren't a valid weave.
 // Returns [ErrBadDelta] if the deltas don't apply to the weave cleanly.
 func Interleave(instructions []Instruction, g VersionGraph, deltas []Delta, baseV, newV VersionID) ([]Instruction, error) {
-	mask, err := Reconstruct(instructions, g, baseV)
+	mask, _, err := Reconstruct(instructions, g, baseV)
 	if err != nil {
 		return nil, err
 	}

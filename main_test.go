@@ -126,7 +126,7 @@ func checkReconstruct(t *testing.T, spec string, v VersionID) {
 		}
 		t.Fatalf("cannot parse line %s: %s", line, err)
 	}
-	mask, err := Reconstruct(instructions, VersionGraph{}, v)
+	mask, _, err := Reconstruct(instructions, VersionGraph{}, v)
 	if err != nil {
 		t.Fatalf("reconstruct failed: %s", err)
 	}
@@ -547,10 +547,10 @@ func TestInterleaveErrors(t *testing.T) {
 ^AE 1
 `
 	tests := []struct {
-		name   string
-		delta  string
-		baseV  int
-		newV   int
+		name  string
+		delta string
+		baseV int
+		newV  int
 	}{
 		{
 			name:  "incomplete delta: only covers first line",
