@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 )
@@ -96,6 +97,8 @@ type Weave struct {
 	Lines        []string
 }
 
+// === Version graph
+
 type VersionGraph struct{}
 
 // IsAncestorOf defines the causal relationship on the version graph.
@@ -106,7 +109,44 @@ func (g VersionGraph) IsAncestorOf(v, w VersionID) bool {
 	return v <= w
 }
 
-// ===
+// === String pool
+
+type StringPool struct {
+	lines       []string
+	lineToIndex map[string]int
+}
+
+func NewStringPool(lines []string) *StringPool {
+	lineToIndex := make(map[string]int, 2*len(lines))
+	for i, line := range lines {
+		_, found := lineToIndex[line]
+		if !found {
+			lineToIndex[line] = i
+		}
+	}
+	return &StringPool{
+		lines:       lines,
+		lineToIndex: lineToIndex,
+	}
+}
+
+func (s *StringPool) Intern(line string) int {
+	idx, found := s.lineToIndex[line]
+	if found {
+		return idx
+	}
+	idx = len(s.lines)
+	s.lineToIndex[line] = idx
+	s.lines = append(s.lines, line)
+	return idx
+}
+
+func (s *StringPool) Lines() []string {
+	return s.lines
+}
+
+// === Priority queue for deltas.
+
 // instructionQueue is a priority queue for weave instructions.
 type instructionQueue struct {
 	vgraph  VersionGraph
@@ -428,6 +468,99 @@ func DiffScript(a, b []int) []Delta {
 	}
 
 	return script
+}
+
+func FormatUnifiedDiff(w io.Writer, filename string, deltas []Delta, lines []string, context int) error {
+	if _, err := fmt.Fprintf(w, "--- %s\n+++ %s\n", filename, filename); err != nil {
+		return err
+	}
+
+	writeLines := func(marker byte, items []int) error {
+		for _, l := range items {
+			if _, err := fmt.Fprintf(w, "%c%s\n", marker, lines[l]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	lineNumber := 1
+	baseLineNumber := 1
+	n := len(deltas)
+	for hunkBegin := 0; hunkBegin < n; {
+		// Skip unchanged lines between hunks.
+		for hunkBegin < n && deltas[hunkBegin].Action == Keep {
+			lineNumber += len(deltas[hunkBegin].Items)
+			baseLineNumber += len(deltas[hunkBegin].Items)
+			hunkBegin++
+		}
+		if hunkBegin >= n {
+			break
+		}
+
+		// Find the extent of this hunk: include all changes and any Keep
+		// blocks that are small enough to be absorbed as intra-hunk context.
+		hunkEnd := hunkBegin
+		hunkBaseLineCount := 0
+		hunkNewLineCount := 0
+		for hunkEnd < n && (deltas[hunkEnd].Action != Keep || len(deltas[hunkEnd].Items) <= 2*context) {
+			delta := deltas[hunkEnd]
+			if delta.Action != Insert {
+				hunkBaseLineCount += len(delta.Items)
+			}
+			if delta.Action != Delete {
+				hunkNewLineCount += len(delta.Items)
+			}
+			hunkEnd++
+		}
+
+		// Compute pre/post context from adjacent Keep blocks.
+		var preContext, postContext []int
+		if hunkBegin > 0 {
+			items := deltas[hunkBegin-1].Items
+			preContext = items[len(items)-min(len(items), context):]
+		}
+		if hunkEnd < n {
+			items := deltas[hunkEnd].Items
+			postContext = items[:min(len(items), context)]
+		}
+
+		hunkBaseStart := baseLineNumber - len(preContext)
+		hunkNewStart := lineNumber - len(preContext)
+		hunkBaseLen := hunkBaseLineCount + len(preContext) + len(postContext)
+		hunkNewLen := hunkNewLineCount + len(preContext) + len(postContext)
+		if _, err := fmt.Fprintf(w, "@@ -%d,%d +%d,%d @@\n", hunkBaseStart, hunkBaseLen, hunkNewStart, hunkNewLen); err != nil {
+			return err
+		}
+
+		if err := writeLines(' ', preContext); err != nil {
+			return err
+		}
+		for hunkBegin < hunkEnd {
+			delta := deltas[hunkBegin]
+			var marker byte
+			switch delta.Action {
+			case Delete:
+				marker = '-'
+				baseLineNumber += len(delta.Items)
+			case Insert:
+				marker = '+'
+				lineNumber += len(delta.Items)
+			case Keep:
+				marker = ' '
+				lineNumber += len(delta.Items)
+				baseLineNumber += len(delta.Items)
+			}
+			if err := writeLines(marker, delta.Items); err != nil {
+				return err
+			}
+			hunkBegin++
+		}
+		if err := writeLines(' ', postContext); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func main() {

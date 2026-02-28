@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func check(t *testing.T, a, b []int, want string) {
+func checkDiffScript(t *testing.T, a, b []int, want string) {
 	t.Helper()
 	got := FormatScript(DiffScript(a, b))
 	if got != want {
@@ -17,57 +17,57 @@ func check(t *testing.T, a, b []int, want string) {
 }
 
 func TestDiffScript(t *testing.T) {
-	check(t, []int{1, 2, 3}, []int{1, 2, 3}, ` 1
+	checkDiffScript(t, []int{1, 2, 3}, []int{1, 2, 3}, ` 1
  2
  3
 `)
-	check(t, []int{}, []int{}, ``)
-	check(t, []int{}, []int{1, 2, 3}, `+1
+	checkDiffScript(t, []int{}, []int{}, ``)
+	checkDiffScript(t, []int{}, []int{1, 2, 3}, `+1
 +2
 +3
 `)
-	check(t, []int{1, 2, 3}, []int{}, `-1
+	checkDiffScript(t, []int{1, 2, 3}, []int{}, `-1
 -2
 -3
 `)
-	check(t, []int{2, 3}, []int{1, 2, 3}, `+1
+	checkDiffScript(t, []int{2, 3}, []int{1, 2, 3}, `+1
  2
  3
 `)
-	check(t, []int{1, 2}, []int{1, 2, 3}, ` 1
+	checkDiffScript(t, []int{1, 2}, []int{1, 2, 3}, ` 1
  2
 +3
 `)
-	check(t, []int{1, 2, 3}, []int{2, 3}, `-1
+	checkDiffScript(t, []int{1, 2, 3}, []int{2, 3}, `-1
  2
  3
 `)
-	check(t, []int{1, 2, 3}, []int{1, 2}, ` 1
+	checkDiffScript(t, []int{1, 2, 3}, []int{1, 2}, ` 1
  2
 -3
 `)
-	check(t, []int{1, 2, 3}, []int{1, 5, 3}, ` 1
+	checkDiffScript(t, []int{1, 2, 3}, []int{1, 5, 3}, ` 1
 -2
 +5
  3
 `)
-	check(t, []int{1, 2}, []int{3, 4}, `-1
+	checkDiffScript(t, []int{1, 2}, []int{3, 4}, `-1
 -2
 +3
 +4
 `)
-	check(t, []int{1, 3, 5}, []int{1, 2, 3, 4, 5}, ` 1
+	checkDiffScript(t, []int{1, 3, 5}, []int{1, 2, 3, 4, 5}, ` 1
 +2
  3
 +4
  5
 `)
-	check(t, []int{1}, []int{1}, ` 1
+	checkDiffScript(t, []int{1}, []int{1}, ` 1
 `)
-	check(t, []int{1}, []int{2}, `-1
+	checkDiffScript(t, []int{1}, []int{2}, `-1
 +2
 `)
-	check(t, []int{4, 1, 8, 8, 8, 1, 2, 3, 4}, []int{4, 9, 8, 1, 2, 3, 5}, ` 4
+	checkDiffScript(t, []int{4, 1, 8, 8, 8, 1, 2, 3, 4}, []int{4, 9, 8, 1, 2, 3, 5}, ` 4
 -1
 -8
 -8
@@ -233,6 +233,38 @@ func parseDeltas(s string) ([]Delta, error) {
 	return deltas, nil
 }
 
+func parseDeltasWithLines(s string) (deltas []Delta, lines []string, err error) {
+	lineNumber := 0
+	stringPool := NewStringPool(nil)
+	for line := range strings.Lines(s) {
+		lineNumber++
+		line = strings.TrimSuffix(line, "\n")
+		if len(line) == 0 {
+			continue
+		}
+
+		var action Action
+		if strings.HasPrefix(line, "+") {
+			action = Insert
+		} else if strings.HasPrefix(line, "-") {
+			action = Delete
+		} else if strings.HasPrefix(line, " ") {
+			action = Keep
+		} else {
+			return nil, nil, fmt.Errorf("failed to parse line %d: %s", lineNumber, line)
+		}
+
+		lineIndex := stringPool.Intern(line[1:])
+		n := len(deltas)
+		if n > 0 && deltas[n-1].Action == action {
+			deltas[n-1].Items = append(deltas[n-1].Items, lineIndex)
+		} else {
+			deltas = append(deltas, Delta{Action: action, Items: []int{lineIndex}})
+		}
+	}
+	return deltas, stringPool.Lines(), nil
+}
+
 func parseWeave(s string) ([]Instruction, error) {
 	var instructions []Instruction
 	lineNumber := 0
@@ -255,13 +287,14 @@ func parseWeave(s string) ([]Instruction, error) {
 		}
 		var instr Instruction
 		instr.Payload = payload
-		if cmd == "^AI" {
+		switch cmd {
+		case "^AI":
 			instr.Type = InstrBeginInsert
-		} else if cmd == "^AD" {
+		case "^AD":
 			instr.Type = InstrBeginDelete
-		} else if cmd == "^AE" {
+		case "^AE":
 			instr.Type = InstrEnd
-		} else {
+		default:
 			return nil, fmt.Errorf("unsupported instruction on line %d: %s", lineNumber, cmd)
 		}
 		instructions = append(instructions, instr)
@@ -542,6 +575,146 @@ func TestInterleave(t *testing.T) {
 ^AE 1
 `, 3, 4)
 
+	// Nested insertions: v2 inserts inside v1, v3 inserts inside v2.
+	checkInterleave(t, `
+^AI 1
+1
+^AI 2
+2
+^AE 2
+3
+^AE 1
+`, `
+  1
++ 10
+  2
+  3
+`, `
+^AI 1
+1
+^AI 2
+^AI 3
+10
+^AE 3
+2
+^AE 2
+3
+^AE 1
+`, 2, 3)
+
+	// Delete a line that was inserted by a previous version.
+	checkInterleave(t, `
+^AI 1
+1
+^AI 2
+2
+^AE 2
+3
+^AE 1
+`, `
+  1
+- 2
+  3
+`, `
+^AI 1
+1
+^AI 2
+^AD 3
+2
+^AE 3
+^AE 2
+3
+^AE 1
+`, 2, 3)
+
+	// Completely replace content: delete all old, insert all new.
+	checkInterleave(t, `
+^AI 1
+1
+2
+3
+^AE 1
+`, `
+- 1
+- 2
+- 3
++ 10
++ 20
++ 30
+`, `
+^AI 1
+^AD 2
+1
+2
+3
+^AE 2
+^AE 1
+^AI 2
+10
+20
+30
+^AE 2
+`, 1, 2)
+
+	// Interleave with multiple deletions spanning non-contiguous regions.
+	// Base has: 1 2 3 4 5. Delete 2 and 4.
+	checkInterleave(t, `
+^AI 1
+1
+2
+3
+4
+5
+^AE 1
+`, `
+  1
+- 2
+  3
+- 4
+  5
+`, `
+^AI 1
+1
+^AD 2
+2
+^AE 2
+3
+^AD 2
+4
+^AE 2
+5
+^AE 1
+`, 1, 2)
+
+	// Simultaneous insert and delete at different positions.
+	// Base: 1 2 3. Delta: insert X before 2, delete 3.
+	checkInterleave(t, `
+^AI 1
+1
+2
+3
+^AE 1
+`, `
+  1
++ 10
+  2
+- 3
+`, `
+^AI 1
+1
+^AI 2
+10
+^AE 2
+2
+^AD 2
+3
+^AE 2
+^AE 1
+`, 1, 2)
+
+	// Empty delta on empty base (no-op).
+	checkInterleave(t, ``, ``, ``, 0, 1)
+
 }
 
 func TestInterleaveErrors(t *testing.T) {
@@ -603,4 +776,220 @@ func TestInterleaveErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func checkUnifiedDiff(t *testing.T, filename, deltaStr, diffStr string, context int) {
+	t.Helper()
+	deltas, lines, err := parseDeltasWithLines(deltaStr)
+	if err != nil {
+		t.Fatalf("failed to parse deltas: %s", err)
+	}
+	var buf strings.Builder
+	if err := FormatUnifiedDiff(&buf, filename, deltas, lines, context); err != nil {
+		t.Fatalf("unexpected io error: %s", err)
+	}
+	formattedDiff := buf.String()
+	expectedDiff := strings.TrimPrefix(diffStr, "\n")
+	// Normalize: in expected string, empty lines between diff markers
+	// should be treated as " \n" (context blank lines).
+	expectedDiff = strings.ReplaceAll(expectedDiff, "\n\n", "\n \n")
+	if formattedDiff != expectedDiff {
+		t.Fatalf("unified diff doesn't match.\nExpected:\n======\n%s======\nGot:\n======\n%s======\n", expectedDiff, formattedDiff)
+	}
+}
+
+func TestUnifiedDiff(t *testing.T) {
+	// All lines are kept - no changes. Should produce just headers.
+	checkUnifiedDiff(t, "test.txt", `
+ line1
+ line2
+ line3
+`, `
+--- test.txt
++++ test.txt
+`, 1)
+
+	// Basic replacement with minimal context.
+	checkUnifiedDiff(t, "main.c", `
+ #include <stdio.h>
+ 
+ int main() {
+-  printf("Hello, World!");
++  printf("Goodbye, cruel world!");
+ }
+`, `
+--- main.c
++++ main.c
+@@ -3,3 +3,3 @@
+ int main() {
+-  printf("Hello, World!");
++  printf("Goodbye, cruel world!");
+ }
+`, 1)
+
+	// Same change with larger context.
+	checkUnifiedDiff(t, "main.c", `
+ #include <stdio.h>
+ 
+ int main() {
+-  printf("Hello, World!");
++  printf("Goodbye, cruel world!");
+ }
+`, `
+--- main.c
++++ main.c
+@@ -1,5 +1,5 @@
+ #include <stdio.h>
+
+ int main() {
+-  printf("Hello, World!");
++  printf("Goodbye, cruel world!");
+ }
+`, 3)
+
+	// Deleting more lines than inserting.
+	checkUnifiedDiff(t, "main.c", `
+ #include <stdio.h>
+ 
+ int main() {
+-  printf("Hello, World!");
+-  return 0;
++  printf("Goodbye, cruel world!");
+ }
+`, `
+--- main.c
++++ main.c
+@@ -1,6 +1,5 @@
+ #include <stdio.h>
+
+ int main() {
+-  printf("Hello, World!");
+-  return 0;
++  printf("Goodbye, cruel world!");
+ }
+`, 3)
+
+	// Multiple separate hunks.
+	checkUnifiedDiff(t, "main.c", `
+ #include <stdio.h>
+ 
+ int main() {
+   for (int i = 0; i < 10; i++) {
+-    printf("Hello, World!");
++    printf("Goodbye, cruel world!");
+   }
+   // comment
+   // another comment
++  return 0;
+ }
+`, `
+--- main.c
++++ main.c
+@@ -4,3 +4,3 @@
+   for (int i = 0; i < 10; i++) {
+-    printf("Hello, World!");
++    printf("Goodbye, cruel world!");
+   }
+@@ -8,2 +8,3 @@
+   // another comment
++  return 0;
+ }
+`, 1)
+
+	// Pure insertion (no deletions).
+	checkUnifiedDiff(t, "file.txt", `
+ line1
++inserted1
++inserted2
+ line2
+ line3
+`, `
+--- file.txt
++++ file.txt
+@@ -1,3 +1,5 @@
+ line1
++inserted1
++inserted2
+ line2
+ line3
+`, 1)
+
+	// Pure deletion (no insertions).
+	checkUnifiedDiff(t, "file.txt", `
+ line1
+-deleted1
+-deleted2
+ line2
+`, `
+--- file.txt
++++ file.txt
+@@ -1,4 +1,2 @@
+ line1
+-deleted1
+-deleted2
+ line2
+`, 1)
+
+	// Change at the very beginning of the file.
+	checkUnifiedDiff(t, "file.txt", `
+-old_first_line
++new_first_line
+ line2
+ line3
+`, `
+--- file.txt
++++ file.txt
+@@ -1,3 +1,3 @@
+-old_first_line
++new_first_line
+ line2
+ line3
+`, 1)
+
+	// Change at the very end of the file.
+	checkUnifiedDiff(t, "file.txt", `
+ line1
+ line2
+-old_last_line
++new_last_line
+`, `
+--- file.txt
++++ file.txt
+@@ -2,2 +2,2 @@
+ line2
+-old_last_line
++new_last_line
+`, 1)
+
+	// Hunks that merge due to small gap (gap <= 2*context).
+	checkUnifiedDiff(t, "file.txt", `
+-line1
++changed1
+ gap
+-line3
++changed3
+`, `
+--- file.txt
++++ file.txt
+@@ -1,3 +1,3 @@
+-line1
++changed1
+ gap
+-line3
++changed3
+`, 1)
+
+	// Zero context.
+	checkUnifiedDiff(t, "file.txt", `
+ line1
+ line2
+-deleted
+ line3
+`, `
+--- file.txt
++++ file.txt
+@@ -3,1 +3,0 @@
+-deleted
+`, 0)
+
 }
