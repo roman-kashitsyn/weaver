@@ -17,68 +17,32 @@ func checkDiffScript(t *testing.T, a, b []int, want string) {
 }
 
 func TestDiffScript(t *testing.T) {
-	checkDiffScript(t, []int{1, 2, 3}, []int{1, 2, 3}, ` 1
- 2
- 3
-`)
-	checkDiffScript(t, []int{}, []int{}, ``)
-	checkDiffScript(t, []int{}, []int{1, 2, 3}, `+1
-+2
-+3
-`)
-	checkDiffScript(t, []int{1, 2, 3}, []int{}, `-1
--2
--3
-`)
-	checkDiffScript(t, []int{2, 3}, []int{1, 2, 3}, `+1
- 2
- 3
-`)
-	checkDiffScript(t, []int{1, 2}, []int{1, 2, 3}, ` 1
- 2
-+3
-`)
-	checkDiffScript(t, []int{1, 2, 3}, []int{2, 3}, `-1
- 2
- 3
-`)
-	checkDiffScript(t, []int{1, 2, 3}, []int{1, 2}, ` 1
- 2
--3
-`)
-	checkDiffScript(t, []int{1, 2, 3}, []int{1, 5, 3}, ` 1
--2
-+5
- 3
-`)
-	checkDiffScript(t, []int{1, 2}, []int{3, 4}, `-1
--2
-+3
-+4
-`)
-	checkDiffScript(t, []int{1, 3, 5}, []int{1, 2, 3, 4, 5}, ` 1
-+2
- 3
-+4
- 5
-`)
-	checkDiffScript(t, []int{1}, []int{1}, ` 1
-`)
-	checkDiffScript(t, []int{1}, []int{2}, `-1
-+2
-`)
-	checkDiffScript(t, []int{4, 1, 8, 8, 8, 1, 2, 3, 4}, []int{4, 9, 8, 1, 2, 3, 5}, ` 4
--1
--8
--8
-+9
- 8
- 1
- 2
- 3
--4
-+5
-`)
+	tests := []struct {
+		name string
+		a, b []int
+		want string
+	}{
+		{"identical", []int{1, 2, 3}, []int{1, 2, 3}, " 1\n 2\n 3\n"},
+		{"both empty", []int{}, []int{}, ``},
+		{"insert all", []int{}, []int{1, 2, 3}, "+1\n+2\n+3\n"},
+		{"delete all", []int{1, 2, 3}, []int{}, "-1\n-2\n-3\n"},
+		{"insert at start", []int{2, 3}, []int{1, 2, 3}, "+1\n 2\n 3\n"},
+		{"insert at end", []int{1, 2}, []int{1, 2, 3}, " 1\n 2\n+3\n"},
+		{"delete at start", []int{1, 2, 3}, []int{2, 3}, "-1\n 2\n 3\n"},
+		{"delete at end", []int{1, 2, 3}, []int{1, 2}, " 1\n 2\n-3\n"},
+		{"replace middle", []int{1, 2, 3}, []int{1, 5, 3}, " 1\n-2\n+5\n 3\n"},
+		{"replace all", []int{1, 2}, []int{3, 4}, "-1\n-2\n+3\n+4\n"},
+		{"interleaved inserts", []int{1, 3, 5}, []int{1, 2, 3, 4, 5}, " 1\n+2\n 3\n+4\n 5\n"},
+		{"single identical", []int{1}, []int{1}, " 1\n"},
+		{"single replace", []int{1}, []int{2}, "-1\n+2\n"},
+		{"complex", []int{4, 1, 8, 8, 8, 1, 2, 3, 4}, []int{4, 9, 8, 1, 2, 3, 5},
+			" 4\n-1\n-8\n-8\n+9\n 8\n 1\n 2\n 3\n-4\n+5\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkDiffScript(t, tt.a, tt.b, tt.want)
+		})
+	}
 }
 
 func checkReconstruct(t *testing.T, spec string, v VersionID) {
@@ -112,13 +76,14 @@ func checkReconstruct(t *testing.T, spec string, v VersionID) {
 			wantMask = append(wantMask, false)
 			var instr Instruction
 			instr.Payload = p
-			if cmd == "^AI" {
+			switch cmd {
+			case "^AI":
 				instr.Type = InstrBeginInsert
-			} else if cmd == "^AD" {
+			case "^AD":
 				instr.Type = InstrBeginDelete
-			} else if cmd == "^AE" {
+			case "^AE":
 				instr.Type = InstrEnd
-			} else {
+			default:
 				t.Fatalf("unsupported instruction: %s", line)
 			}
 			instructions = append(instructions, instr)
@@ -126,7 +91,8 @@ func checkReconstruct(t *testing.T, spec string, v VersionID) {
 		}
 		t.Fatalf("cannot parse line %s: %s", line, err)
 	}
-	mask, _, err := Reconstruct(instructions, VersionGraph{}, v)
+	activeSet := linearActiveSet(v, versionCount(instructions))
+	mask, _, err := Reconstruct(instructions, v, activeSet)
 	if err != nil {
 		t.Fatalf("reconstruct failed: %s", err)
 	}
@@ -234,27 +200,33 @@ func parseDeltas(s string) ([]Delta, error) {
 }
 
 func parseDeltasWithLines(s string) (deltas []Delta, lines []string, err error) {
+	s = strings.TrimPrefix(s, "\n")
+	s = strings.TrimSuffix(s, "\n")
 	lineNumber := 0
 	stringPool := NewStringPool(nil)
 	for line := range strings.Lines(s) {
 		lineNumber++
 		line = strings.TrimSuffix(line, "\n")
-		if len(line) == 0 {
-			continue
-		}
 
 		var action Action
+		var content string
 		if strings.HasPrefix(line, "+") {
 			action = Insert
+			content = line[1:]
 		} else if strings.HasPrefix(line, "-") {
 			action = Delete
+			content = line[1:]
 		} else if strings.HasPrefix(line, " ") {
 			action = Keep
+			content = line[1:]
+		} else if len(line) == 0 {
+			action = Keep
+			content = ""
 		} else {
 			return nil, nil, fmt.Errorf("failed to parse line %d: %s", lineNumber, line)
 		}
 
-		lineIndex := stringPool.Intern(line[1:])
+		lineIndex := stringPool.Intern(content)
 		n := len(deltas)
 		if n > 0 && deltas[n-1].Action == action {
 			deltas[n-1].Items = append(deltas[n-1].Items, lineIndex)
@@ -263,6 +235,18 @@ func parseDeltasWithLines(s string) (deltas []Delta, lines []string, err error) 
 		}
 	}
 	return deltas, stringPool.Lines(), nil
+}
+
+func versionCount(weave []Instruction) int {
+	result := 0
+	for _, instr := range weave {
+		switch instr.Type {
+		case InstrBeginInsert, InstrBeginDelete:
+			result = max(result, instr.Payload)
+
+		}
+	}
+	return result
 }
 
 func parseWeave(s string) ([]Instruction, error) {
@@ -302,6 +286,14 @@ func parseWeave(s string) ([]Instruction, error) {
 	return instructions, nil
 }
 
+func linearActiveSet(v VersionID, count int) ActiveSet {
+	activeSet := make(ActiveSet, max(int(v), count)+1)
+	for i := range int(v) + 1 {
+		activeSet[i] = true
+	}
+	return activeSet
+}
+
 func checkInterleave(t *testing.T, baseStr, deltasStr, resultStr string, baseV, newV int) {
 	baseW, err := parseWeave(baseStr)
 	if err != nil {
@@ -315,9 +307,9 @@ func checkInterleave(t *testing.T, baseStr, deltasStr, resultStr string, baseV, 
 	if err != nil {
 		t.Fatalf("failed to parse result weave: %s", err)
 	}
-	var g VersionGraph
+	activeSet := linearActiveSet(VersionID(newV), versionCount(resultW))
 
-	interleaved, err := Interleave(baseW, g, deltas, VersionID(baseV), VersionID(newV))
+	interleaved, err := Interleave(baseW, deltas, activeSet, VersionID(baseV), VersionID(newV))
 	if err != nil {
 		t.Fatalf("interleave failed: %s", err)
 	}
@@ -325,51 +317,43 @@ func checkInterleave(t *testing.T, baseStr, deltasStr, resultStr string, baseV, 
 		t.Fatalf("Expected:\n%sGot:\n%s", FormatWeave(resultW), FormatWeave(interleaved))
 	}
 
-	reconstructedDelta, err := ReconstructDelta(resultW, g, VersionID(newV))
+	reconstructedDelta, err := ReconstructDelta(resultW, VersionID(newV), activeSet)
 	if !slices.EqualFunc(reconstructedDelta, deltas, EqualDeltas) {
 		t.Fatalf("delta reconstruction failed:\nExpected:\n%sGot:\n%s", FormatScript(deltas), FormatScript(reconstructedDelta))
 	}
 }
 
 func TestInterleave(t *testing.T) {
-	// Add a few lines to an empty file.
-	checkInterleave(t, "", `
-+ 1
-+ 2
-+ 3
-`, `
+	tests := []struct {
+		name    string
+		base    string
+		delta   string
+		result  string
+		baseV   int
+		newV    int
+	}{
+		{
+			name:  "insert into empty file",
+			base:  "",
+			delta: "+ 1\n+ 2\n+ 3\n",
+			result: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, 0, 1)
-	// Insert two lines in the middle of a file.
-	checkInterleave(t, `
+`, baseV: 0, newV: 1,
+		},
+		{
+			name: "insert in the middle",
+			base: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, `
-  1
-  2
-+ 4
-+ 5
-  3
-`, `
-^AI 1
-1
-2
-^AI 2
-4
-5
-^AE 2
-3
-^AE 1
-`, 1, 2)
-	// Delete two lines that belong to adjacent deltas.
-	checkInterleave(t, `
+`, delta: "  1\n  2\n+ 4\n+ 5\n  3\n",
+			result: `
 ^AI 1
 1
 2
@@ -379,13 +363,22 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, `
-  1
-- 2
-- 4
-  5
-  3
-`, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "delete across adjacent deltas",
+			base: `
+^AI 1
+1
+2
+^AI 2
+4
+5
+^AE 2
+3
+^AE 1
+`, delta: "  1\n- 2\n- 4\n  5\n  3\n",
+			result: `
 ^AI 1
 1
 ^AD 3
@@ -397,22 +390,18 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, 2, 3)
-
-	// Insert at the beginning of an existing version.
-	checkInterleave(t, `
+`, baseV: 2, newV: 3,
+		},
+		{
+			name: "insert at the beginning",
+			base: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, `
-+ 10
-+ 11
-  1
-  2
-  3
-`, `
+`, delta: "+ 10\n+ 11\n  1\n  2\n  3\n",
+			result: `
 ^AI 1
 ^AI 2
 10
@@ -422,22 +411,18 @@ func TestInterleave(t *testing.T) {
 2
 3
 ^AE 1
-`, 1, 2)
-
-	// Append at the end of an existing version.
-	checkInterleave(t, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "append at the end",
+			base: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, `
-  1
-  2
-  3
-+ 10
-+ 11
-`, `
+`, delta: "  1\n  2\n  3\n+ 10\n+ 11\n",
+			result: `
 ^AI 1
 1
 2
@@ -447,20 +432,18 @@ func TestInterleave(t *testing.T) {
 10
 11
 ^AE 2
-`, 1, 2)
-
-	// Delete all lines.
-	checkInterleave(t, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "delete all lines",
+			base: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, `
-- 1
-- 2
-- 3
-`, `
+`, delta: "- 1\n- 2\n- 3\n",
+			result: `
 ^AI 1
 ^AD 2
 1
@@ -468,21 +451,18 @@ func TestInterleave(t *testing.T) {
 3
 ^AE 2
 ^AE 1
-`, 1, 2)
-
-	// Replace a line (delete followed by insert at the same position).
-	checkInterleave(t, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "replace a line",
+			base: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, `
-  1
-- 2
-+ 20
-  3
-`, `
+`, delta: "  1\n- 2\n+ 20\n  3\n",
+			result: `
 ^AI 1
 1
 ^AD 2
@@ -493,10 +473,11 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, 1, 2)
-
-	// Multiple scattered insertions between kept lines.
-	checkInterleave(t, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "multiple scattered insertions",
+			base: `
 ^AI 1
 1
 2
@@ -504,17 +485,8 @@ func TestInterleave(t *testing.T) {
 4
 5
 ^AE 1
-`, `
-+ 10
-  1
-+ 20
-  2
-  3
-+ 30
-+ 31
-  4
-  5
-`, `
+`, delta: "+ 10\n  1\n+ 20\n  2\n  3\n+ 30\n+ 31\n  4\n  5\n",
+			result: `
 ^AI 1
 ^AI 2
 10
@@ -532,14 +504,11 @@ func TestInterleave(t *testing.T) {
 4
 5
 ^AE 1
-`, 1, 2)
-
-	// Fourth version on top of a weave with deleted regions.
-	// Version 3 sees: 1, 5, 3 (lines 2 and 4 were deleted by v3).
-	// Delta: keep 1, insert 10, keep 5, delete 3.
-	// The insert lands after the inactive ^AD/^AE block because the
-	// algorithm drains non-masked instructions before processing deltas.
-	checkInterleave(t, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "fourth version on top of deleted regions",
+			base: `
 ^AI 1
 1
 ^AD 3
@@ -551,12 +520,8 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, `
-  1
-+ 10
-  5
-- 3
-`, `
+`, delta: "  1\n+ 10\n  5\n- 3\n",
+			result: `
 ^AI 1
 1
 ^AD 3
@@ -573,10 +538,11 @@ func TestInterleave(t *testing.T) {
 3
 ^AE 4
 ^AE 1
-`, 3, 4)
-
-	// Nested insertions: v2 inserts inside v1, v3 inserts inside v2.
-	checkInterleave(t, `
+`, baseV: 3, newV: 4,
+		},
+		{
+			name: "nested insertions",
+			base: `
 ^AI 1
 1
 ^AI 2
@@ -584,12 +550,8 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, `
-  1
-+ 10
-  2
-  3
-`, `
+`, delta: "  1\n+ 10\n  2\n  3\n",
+			result: `
 ^AI 1
 1
 ^AI 2
@@ -600,10 +562,11 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, 2, 3)
-
-	// Delete a line that was inserted by a previous version.
-	checkInterleave(t, `
+`, baseV: 2, newV: 3,
+		},
+		{
+			name: "delete a previously inserted line",
+			base: `
 ^AI 1
 1
 ^AI 2
@@ -611,11 +574,8 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, `
-  1
-- 2
-  3
-`, `
+`, delta: "  1\n- 2\n  3\n",
+			result: `
 ^AI 1
 1
 ^AI 2
@@ -625,23 +585,18 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 3
 ^AE 1
-`, 2, 3)
-
-	// Completely replace content: delete all old, insert all new.
-	checkInterleave(t, `
+`, baseV: 2, newV: 3,
+		},
+		{
+			name: "completely replace content",
+			base: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, `
-- 1
-- 2
-- 3
-+ 10
-+ 20
-+ 30
-`, `
+`, delta: "- 1\n- 2\n- 3\n+ 10\n+ 20\n+ 30\n",
+			result: `
 ^AI 1
 ^AD 2
 1
@@ -654,11 +609,11 @@ func TestInterleave(t *testing.T) {
 20
 30
 ^AE 2
-`, 1, 2)
-
-	// Interleave with multiple deletions spanning non-contiguous regions.
-	// Base has: 1 2 3 4 5. Delete 2 and 4.
-	checkInterleave(t, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "multiple non-contiguous deletions",
+			base: `
 ^AI 1
 1
 2
@@ -666,13 +621,8 @@ func TestInterleave(t *testing.T) {
 4
 5
 ^AE 1
-`, `
-  1
-- 2
-  3
-- 4
-  5
-`, `
+`, delta: "  1\n- 2\n  3\n- 4\n  5\n",
+			result: `
 ^AI 1
 1
 ^AD 2
@@ -684,22 +634,18 @@ func TestInterleave(t *testing.T) {
 ^AE 2
 5
 ^AE 1
-`, 1, 2)
-
-	// Simultaneous insert and delete at different positions.
-	// Base: 1 2 3. Delta: insert X before 2, delete 3.
-	checkInterleave(t, `
+`, baseV: 1, newV: 2,
+		},
+		{
+			name: "simultaneous insert and delete",
+			base: `
 ^AI 1
 1
 2
 3
 ^AE 1
-`, `
-  1
-+ 10
-  2
-- 3
-`, `
+`, delta: "  1\n+ 10\n  2\n- 3\n",
+			result: `
 ^AI 1
 1
 ^AI 2
@@ -710,11 +656,21 @@ func TestInterleave(t *testing.T) {
 3
 ^AE 2
 ^AE 1
-`, 1, 2)
-
-	// Empty delta on empty base (no-op).
-	checkInterleave(t, ``, ``, ``, 0, 1)
-
+`, baseV: 1, newV: 2,
+		},
+		{
+			name:   "empty delta on empty base",
+			base:   "",
+			delta:  "",
+			result: "",
+			baseV:  0, newV: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkInterleave(t, tt.base, tt.delta, tt.result, tt.baseV, tt.newV)
+		})
+	}
 }
 
 func TestInterleaveErrors(t *testing.T) {
@@ -767,7 +723,8 @@ func TestInterleaveErrors(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse deltas: %s", err)
 			}
-			_, err = Interleave(baseW, VersionGraph{}, deltas, VersionID(tt.baseV), VersionID(tt.newV))
+			activeSet := linearActiveSet(VersionID(tt.newV), tt.newV)
+			_, err = Interleave(baseW, deltas, activeSet, VersionID(tt.baseV), VersionID(tt.newV))
 			if err == nil {
 				t.Fatal("expected an error, got nil")
 			}
@@ -799,25 +756,39 @@ func checkUnifiedDiff(t *testing.T, filename, deltaStr, diffStr string, context 
 }
 
 func TestUnifiedDiff(t *testing.T) {
-	// All lines are kept - no changes. Should produce just headers.
-	checkUnifiedDiff(t, "test.txt", `
+	tests := []struct {
+		name     string
+		filename string
+		delta    string
+		diff     string
+		context  int
+	}{
+		{
+			name:     "no changes",
+			filename: "test.txt",
+			delta: `
  line1
  line2
  line3
-`, `
+`,
+			diff: `
 --- test.txt
 +++ test.txt
-`, 1)
-
-	// Basic replacement with minimal context.
-	checkUnifiedDiff(t, "main.c", `
+`,
+			context: 1,
+		},
+		{
+			name:     "basic replacement",
+			filename: "main.c",
+			delta: `
  #include <stdio.h>
- 
+
  int main() {
 -  printf("Hello, World!");
 +  printf("Goodbye, cruel world!");
  }
-`, `
+`,
+			diff: `
 --- main.c
 +++ main.c
 @@ -3,3 +3,3 @@
@@ -825,17 +796,21 @@ func TestUnifiedDiff(t *testing.T) {
 -  printf("Hello, World!");
 +  printf("Goodbye, cruel world!");
  }
-`, 1)
-
-	// Same change with larger context.
-	checkUnifiedDiff(t, "main.c", `
+`,
+			context: 1,
+		},
+		{
+			name:     "larger context",
+			filename: "main.c",
+			delta: `
  #include <stdio.h>
- 
+
  int main() {
 -  printf("Hello, World!");
 +  printf("Goodbye, cruel world!");
  }
-`, `
+`,
+			diff: `
 --- main.c
 +++ main.c
 @@ -1,5 +1,5 @@
@@ -845,18 +820,22 @@ func TestUnifiedDiff(t *testing.T) {
 -  printf("Hello, World!");
 +  printf("Goodbye, cruel world!");
  }
-`, 3)
-
-	// Deleting more lines than inserting.
-	checkUnifiedDiff(t, "main.c", `
+`,
+			context: 3,
+		},
+		{
+			name:     "more deletes than inserts",
+			filename: "main.c",
+			delta: `
  #include <stdio.h>
- 
+
  int main() {
 -  printf("Hello, World!");
 -  return 0;
 +  printf("Goodbye, cruel world!");
  }
-`, `
+`,
+			diff: `
 --- main.c
 +++ main.c
 @@ -1,6 +1,5 @@
@@ -867,12 +846,15 @@ func TestUnifiedDiff(t *testing.T) {
 -  return 0;
 +  printf("Goodbye, cruel world!");
  }
-`, 3)
-
-	// Multiple separate hunks.
-	checkUnifiedDiff(t, "main.c", `
+`,
+			context: 3,
+		},
+		{
+			name:     "multiple separate hunks",
+			filename: "main.c",
+			delta: `
  #include <stdio.h>
- 
+
  int main() {
    for (int i = 0; i < 10; i++) {
 -    printf("Hello, World!");
@@ -882,7 +864,8 @@ func TestUnifiedDiff(t *testing.T) {
    // another comment
 +  return 0;
  }
-`, `
+`,
+			diff: `
 --- main.c
 +++ main.c
 @@ -4,3 +4,3 @@
@@ -894,16 +877,20 @@ func TestUnifiedDiff(t *testing.T) {
    // another comment
 +  return 0;
  }
-`, 1)
-
-	// Pure insertion (no deletions).
-	checkUnifiedDiff(t, "file.txt", `
+`,
+			context: 1,
+		},
+		{
+			name:     "pure insertion",
+			filename: "file.txt",
+			delta: `
  line1
 +inserted1
 +inserted2
  line2
  line3
-`, `
+`,
+			diff: `
 --- file.txt
 +++ file.txt
 @@ -1,3 +1,5 @@
@@ -912,15 +899,19 @@ func TestUnifiedDiff(t *testing.T) {
 +inserted2
  line2
  line3
-`, 1)
-
-	// Pure deletion (no insertions).
-	checkUnifiedDiff(t, "file.txt", `
+`,
+			context: 1,
+		},
+		{
+			name:     "pure deletion",
+			filename: "file.txt",
+			delta: `
  line1
 -deleted1
 -deleted2
  line2
-`, `
+`,
+			diff: `
 --- file.txt
 +++ file.txt
 @@ -1,4 +1,2 @@
@@ -928,15 +919,19 @@ func TestUnifiedDiff(t *testing.T) {
 -deleted1
 -deleted2
  line2
-`, 1)
-
-	// Change at the very beginning of the file.
-	checkUnifiedDiff(t, "file.txt", `
+`,
+			context: 1,
+		},
+		{
+			name:     "change at beginning",
+			filename: "file.txt",
+			delta: `
 -old_first_line
 +new_first_line
  line2
  line3
-`, `
+`,
+			diff: `
 --- file.txt
 +++ file.txt
 @@ -1,3 +1,3 @@
@@ -944,31 +939,39 @@ func TestUnifiedDiff(t *testing.T) {
 +new_first_line
  line2
  line3
-`, 1)
-
-	// Change at the very end of the file.
-	checkUnifiedDiff(t, "file.txt", `
+`,
+			context: 1,
+		},
+		{
+			name:     "change at end",
+			filename: "file.txt",
+			delta: `
  line1
  line2
 -old_last_line
 +new_last_line
-`, `
+`,
+			diff: `
 --- file.txt
 +++ file.txt
 @@ -2,2 +2,2 @@
  line2
 -old_last_line
 +new_last_line
-`, 1)
-
-	// Hunks that merge due to small gap (gap <= 2*context).
-	checkUnifiedDiff(t, "file.txt", `
+`,
+			context: 1,
+		},
+		{
+			name:     "hunks merge due to small gap",
+			filename: "file.txt",
+			delta: `
 -line1
 +changed1
  gap
 -line3
 +changed3
-`, `
+`,
+			diff: `
 --- file.txt
 +++ file.txt
 @@ -1,3 +1,3 @@
@@ -977,19 +980,367 @@ func TestUnifiedDiff(t *testing.T) {
  gap
 -line3
 +changed3
-`, 1)
-
-	// Zero context.
-	checkUnifiedDiff(t, "file.txt", `
+`,
+			context: 1,
+		},
+		{
+			name:     "zero context",
+			filename: "file.txt",
+			delta: `
  line1
  line2
 -deleted
  line3
-`, `
+`,
+			diff: `
 --- file.txt
 +++ file.txt
 @@ -3,1 +3,0 @@
 -deleted
-`, 0)
+`,
+			context: 0,
+		},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkUnifiedDiff(t, tt.filename, tt.delta, tt.diff, tt.context)
+		})
+	}
+}
+
+func makeActiveSet(ancestors []int, maxVersion int) ActiveSet {
+	as := make(ActiveSet, maxVersion+1)
+	for _, v := range ancestors {
+		as[v] = true
+	}
+	return as
+}
+
+func reconstructLines(t *testing.T, weave []Instruction, v VersionID, as ActiveSet) []int {
+	t.Helper()
+	mask, _, err := Reconstruct(weave, v, as)
+	if err != nil {
+		t.Fatalf("Reconstruct(v=%d): %s", v, err)
+	}
+	var lines []int
+	for i, instr := range weave {
+		if mask[i] {
+			lines = append(lines, instr.Line())
+		}
+	}
+	return lines
+}
+
+func TestNonLinearHistory(t *testing.T) {
+	// Version graph:
+	//   1 → 2 → 3
+	//   1 → 4 → 5
+
+	as := func(ancestors ...int) ActiveSet {
+		return makeActiveSet(ancestors, 5)
+	}
+
+	interleave := func(weave []Instruction, deltaStr string, activeSet ActiveSet, baseV, newV int) []Instruction {
+		t.Helper()
+		deltas, err := parseDeltas(deltaStr)
+		if err != nil {
+			t.Fatalf("parse deltas for v%d: %s", newV, err)
+		}
+		result, err := Interleave(weave, deltas, activeSet, VersionID(baseV), VersionID(newV))
+		if err != nil {
+			t.Fatalf("interleave v%d: %s", newV, err)
+		}
+		return result
+	}
+
+	// v1: creates lines 1, 2, 3
+	weave := interleave(nil, `
++ 1
++ 2
++ 3
+`, as(0, 1), 0, 1)
+
+	// v2: inserts 10 after 1
+	weave = interleave(weave, `
+  1
++ 10
+  2
+  3
+`, as(0, 1, 2), 1, 2)
+
+	// v4: deletes 2 (from v1, independent branch)
+	weave = interleave(weave, `
+  1
+- 2
+  3
+`, as(0, 1, 4), 1, 4)
+
+	// v3: deletes 10 (from v2)
+	weave = interleave(weave, `
+  1
+- 10
+  2
+  3
+`, as(0, 1, 2, 3), 2, 3)
+
+	// v5: inserts 20 before 3 (from v4)
+	weave = interleave(weave, `
+  1
++ 20
+  3
+`, as(0, 1, 4, 5), 4, 5)
+
+	wantWeave, err := parseWeave(`
+^AI 1
+1
+^AI 2
+^AD 3
+10
+^AE 3
+^AE 2
+^AD 4
+2
+^AE 4
+^AI 5
+20
+^AE 5
+3
+^AE 1
+`)
+	if err != nil {
+		t.Fatalf("parse expected weave: %s", err)
+	}
+	if !slices.Equal(weave, wantWeave) {
+		t.Fatalf("weave mismatch:\nExpected:\n%sGot:\n%s", FormatWeave(wantWeave), FormatWeave(weave))
+	}
+
+	// Verify reconstruction for all versions.
+	t.Run("reconstruct", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			v         VersionID
+			ancestors []int
+			want      []int
+		}{
+			{"v1", 1, []int{0, 1}, []int{1, 2, 3}},
+			{"v2", 2, []int{0, 1, 2}, []int{1, 10, 2, 3}},
+			{"v3", 3, []int{0, 1, 2, 3}, []int{1, 2, 3}},
+			{"v4", 4, []int{0, 1, 4}, []int{1, 3}},
+			{"v5", 5, []int{0, 1, 4, 5}, []int{1, 20, 3}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				got := reconstructLines(t, weave, tt.v, as(tt.ancestors...))
+				if !slices.Equal(got, tt.want) {
+					t.Fatalf("got %v, want %v", got, tt.want)
+				}
+			})
+		}
+	})
+
+	// Verify delta reconstruction.
+	t.Run("reconstruct_delta", func(t *testing.T) {
+		checkDelta := func(name string, v VersionID, ancestors []int, wantStr string) {
+			t.Run(name, func(t *testing.T) {
+				t.Helper()
+				wantDeltas, err := parseDeltas(wantStr)
+				if err != nil {
+					t.Fatalf("parse expected deltas: %s", err)
+				}
+				got, err := ReconstructDelta(weave, v, as(ancestors...))
+				if err != nil {
+					t.Fatalf("error: %s", err)
+				}
+				if !slices.EqualFunc(got, wantDeltas, EqualDeltas) {
+					t.Fatalf("got:\n%swant:\n%s", FormatScript(got), FormatScript(wantDeltas))
+				}
+			})
+		}
+		checkDelta("v2", 2, []int{0, 1, 2}, "  1\n+ 10\n  2\n  3\n")
+		checkDelta("v3", 3, []int{0, 1, 2, 3}, "  1\n- 10\n  2\n  3\n")
+		checkDelta("v4", 4, []int{0, 1, 4}, "  1\n- 2\n  3\n")
+		checkDelta("v5", 5, []int{0, 1, 4, 5}, "  1\n+ 20\n  3\n")
+	})
+}
+
+func TestNonLinearConflictingDeletes(t *testing.T) {
+	// Version graph:
+	//   1 → 2   (delete line 2)
+	//   1 → 3   (also delete line 2, independently)
+	//
+	// Both branches independently delete the same line.
+
+	as := func(ancestors ...int) ActiveSet {
+		return makeActiveSet(ancestors, 3)
+	}
+
+	interleave := func(weave []Instruction, deltaStr string, activeSet ActiveSet, baseV, newV int) []Instruction {
+		t.Helper()
+		deltas, err := parseDeltas(deltaStr)
+		if err != nil {
+			t.Fatalf("parse deltas for v%d: %s", newV, err)
+		}
+		result, err := Interleave(weave, deltas, activeSet, VersionID(baseV), VersionID(newV))
+		if err != nil {
+			t.Fatalf("interleave v%d: %s", newV, err)
+		}
+		return result
+	}
+
+	weave := interleave(nil, "+ 1\n+ 2\n+ 3\n", as(0, 1), 0, 1)
+	weave = interleave(weave, "  1\n- 2\n  3\n", as(0, 1, 2), 1, 2)
+	weave = interleave(weave, "  1\n- 2\n  3\n", as(0, 1, 3), 1, 3)
+
+	wantWeave, err := parseWeave(`
+^AI 1
+1
+^AD 2
+^AD 3
+2
+^AE 3
+^AE 2
+3
+^AE 1
+`)
+	if err != nil {
+		t.Fatalf("parse expected weave: %s", err)
+	}
+	if !slices.Equal(weave, wantWeave) {
+		t.Fatalf("weave mismatch:\nExpected:\n%sGot:\n%s", FormatWeave(wantWeave), FormatWeave(weave))
+	}
+
+	t.Run("reconstruct", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			v         VersionID
+			ancestors []int
+			want      []int
+		}{
+			{"v1", 1, []int{0, 1}, []int{1, 2, 3}},
+			{"v2", 2, []int{0, 1, 2}, []int{1, 3}},
+			{"v3", 3, []int{0, 1, 3}, []int{1, 3}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				got := reconstructLines(t, weave, tt.v, as(tt.ancestors...))
+				if !slices.Equal(got, tt.want) {
+					t.Fatalf("got %v, want %v", got, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("reconstruct_delta", func(t *testing.T) {
+		checkDelta := func(name string, v VersionID, ancestors []int, wantStr string) {
+			t.Run(name, func(t *testing.T) {
+				t.Helper()
+				wantDeltas, err := parseDeltas(wantStr)
+				if err != nil {
+					t.Fatalf("parse expected deltas: %s", err)
+				}
+				got, err := ReconstructDelta(weave, v, as(ancestors...))
+				if err != nil {
+					t.Fatalf("error: %s", err)
+				}
+				if !slices.EqualFunc(got, wantDeltas, EqualDeltas) {
+					t.Fatalf("got:\n%swant:\n%s", FormatScript(got), FormatScript(wantDeltas))
+				}
+			})
+		}
+		checkDelta("v2", 2, []int{0, 1, 2}, "  1\n- 2\n  3\n")
+		checkDelta("v3", 3, []int{0, 1, 3}, "  1\n- 2\n  3\n")
+	})
+}
+
+func TestNonLinearInsertAtDeletedPosition(t *testing.T) {
+	// Version graph:
+	//   1 → 2   (replace line 2 with 20)
+	//   1 → 3   (delete line 2)
+	//
+	// One branch replaces a line, the other just deletes it.
+
+	as := func(ancestors ...int) ActiveSet {
+		return makeActiveSet(ancestors, 3)
+	}
+
+	interleave := func(weave []Instruction, deltaStr string, activeSet ActiveSet, baseV, newV int) []Instruction {
+		t.Helper()
+		deltas, err := parseDeltas(deltaStr)
+		if err != nil {
+			t.Fatalf("parse deltas for v%d: %s", newV, err)
+		}
+		result, err := Interleave(weave, deltas, activeSet, VersionID(baseV), VersionID(newV))
+		if err != nil {
+			t.Fatalf("interleave v%d: %s", newV, err)
+		}
+		return result
+	}
+
+	weave := interleave(nil, "+ 1\n+ 2\n+ 3\n", as(0, 1), 0, 1)
+	weave = interleave(weave, "  1\n- 2\n+ 20\n  3\n", as(0, 1, 2), 1, 2)
+	weave = interleave(weave, "  1\n- 2\n  3\n", as(0, 1, 3), 1, 3)
+
+	wantWeave, err := parseWeave(`
+^AI 1
+1
+^AD 2
+^AD 3
+2
+^AE 3
+^AE 2
+^AI 2
+20
+^AE 2
+3
+^AE 1
+`)
+	if err != nil {
+		t.Fatalf("parse expected weave: %s", err)
+	}
+	if !slices.Equal(weave, wantWeave) {
+		t.Fatalf("weave mismatch:\nExpected:\n%sGot:\n%s", FormatWeave(wantWeave), FormatWeave(weave))
+	}
+
+	t.Run("reconstruct", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			v         VersionID
+			ancestors []int
+			want      []int
+		}{
+			{"v1", 1, []int{0, 1}, []int{1, 2, 3}},
+			{"v2", 2, []int{0, 1, 2}, []int{1, 20, 3}},
+			{"v3", 3, []int{0, 1, 3}, []int{1, 3}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				got := reconstructLines(t, weave, tt.v, as(tt.ancestors...))
+				if !slices.Equal(got, tt.want) {
+					t.Fatalf("got %v, want %v", got, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("reconstruct_delta", func(t *testing.T) {
+		checkDelta := func(name string, v VersionID, ancestors []int, wantStr string) {
+			t.Run(name, func(t *testing.T) {
+				t.Helper()
+				wantDeltas, err := parseDeltas(wantStr)
+				if err != nil {
+					t.Fatalf("parse expected deltas: %s", err)
+				}
+				got, err := ReconstructDelta(weave, v, as(ancestors...))
+				if err != nil {
+					t.Fatalf("error: %s", err)
+				}
+				if !slices.EqualFunc(got, wantDeltas, EqualDeltas) {
+					t.Fatalf("got:\n%swant:\n%s", FormatScript(got), FormatScript(wantDeltas))
+				}
+			})
+		}
+		checkDelta("v2", 2, []int{0, 1, 2}, "  1\n- 2\n+ 20\n  3\n")
+		checkDelta("v3", 3, []int{0, 1, 3}, "  1\n- 2\n  3\n")
+	})
 }

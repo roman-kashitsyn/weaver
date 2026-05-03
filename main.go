@@ -145,20 +145,21 @@ func (s *StringPool) Lines() []string {
 	return s.lines
 }
 
+// === Active set
+
+type ActiveSet []bool
+
 // === Priority queue for deltas.
 
 // instructionQueue is a priority queue for weave instructions.
 type instructionQueue struct {
-	vgraph  VersionGraph
 	entries []Instruction
 }
 
 var _ heap.Interface = &instructionQueue{}
 
-func NewQueue(g VersionGraph) *instructionQueue {
-	q := new(instructionQueue)
-	q.vgraph = g
-	return q
+func NewQueue() *instructionQueue {
+	return new(instructionQueue)
 }
 
 func (q *instructionQueue) Push(e any) {
@@ -177,8 +178,7 @@ func (q *instructionQueue) Swap(i, j int) {
 }
 
 func (q *instructionQueue) Less(i, j int) bool {
-	// The most recent version must be at the top.
-	return q.vgraph.IsAncestorOf(q.entries[j].VersionID(), q.entries[i].VersionID())
+	return q.entries[j].VersionID() < q.entries[i].VersionID()
 }
 
 func (q *instructionQueue) Len() int {
@@ -198,34 +198,34 @@ func (q *instructionQueue) closeInstr(v VersionID) (Instruction, error) {
 // and the IDs of versions to which the enabled lines are attributed.
 //
 // Returns the [ErrBadWeave] if the instructions aren't a valid weave.
-func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]bool, []VersionID, error) {
+func Reconstruct(instructions []Instruction, v VersionID, activeSet ActiveSet) ([]bool, []VersionID, error) {
 	mask := make([]bool, len(instructions))
 	var versions []VersionID
-	activeSet := NewQueue(g)
-	inactiveSet := NewQueue(g)
+	enabledVersions := NewQueue()
+	disabledVersions := NewQueue()
 	for i, instr := range instructions {
 		switch instr.Type {
 		case InstrLine:
-			if activeSet.Len() == 0 {
+			if enabledVersions.Len() == 0 {
 				return nil, nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
 			}
-			top := activeSet.entries[0]
-			if g.IsAncestorOf(top.VersionID(), v) && top.Type == InstrBeginInsert {
+			top := enabledVersions.entries[0]
+			if activeSet[top.VersionID()] && top.Type == InstrBeginInsert {
 				mask[i] = true
 				versions = append(versions, top.VersionID())
 			}
 		case InstrBeginInsert:
-			heap.Push(activeSet, instr)
+			heap.Push(enabledVersions, instr)
 		case InstrBeginDelete:
-			if g.IsAncestorOf(instr.VersionID(), v) {
-				heap.Push(activeSet, instr)
+			if activeSet[instr.VersionID()] {
+				heap.Push(enabledVersions, instr)
 			} else {
-				heap.Push(inactiveSet, instr)
+				heap.Push(disabledVersions, instr)
 			}
 		case InstrEnd:
-			_, err := activeSet.closeInstr(instr.VersionID())
+			_, err := enabledVersions.closeInstr(instr.VersionID())
 			if err != nil {
-				if _, err := inactiveSet.closeInstr(instr.VersionID()); err != nil {
+				if _, err := disabledVersions.closeInstr(instr.VersionID()); err != nil {
 					return nil, nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
 				}
 			}
@@ -238,8 +238,8 @@ func Reconstruct(instructions []Instruction, g VersionGraph, v VersionID) ([]boo
 //
 // Returns [ErrBadWeave] if the instructions aren't a valid weave.
 // Returns [ErrBadDelta] if the deltas don't apply to the weave cleanly.
-func Interleave(instructions []Instruction, g VersionGraph, deltas []Delta, baseV, newV VersionID) ([]Instruction, error) {
-	mask, _, err := Reconstruct(instructions, g, baseV)
+func Interleave(instructions []Instruction, deltas []Delta, activeSet ActiveSet, baseV, newV VersionID) ([]Instruction, error) {
+	mask, _, err := Reconstruct(instructions, baseV, activeSet)
 	if err != nil {
 		return nil, err
 	}
@@ -303,30 +303,35 @@ func Interleave(instructions []Instruction, g VersionGraph, deltas []Delta, base
 }
 
 // ReconstructDelta extracts from a weave the changes introduced by the specified version.
-func ReconstructDelta(instructions []Instruction, g VersionGraph, v VersionID) ([]Delta, error) {
+func ReconstructDelta(instructions []Instruction, v VersionID, activeSet ActiveSet) ([]Delta, error) {
 	var deltas []Delta
 	delta := Delta{Action: Keep, Items: nil}
-	activeSet := NewQueue(g)
-	inactiveSet := NewQueue(g)
+	enabledVersions := NewQueue()
+	inactiveVersions := NewQueue()
 
 	for i, instr := range instructions {
 		switch instr.Type {
 		case InstrLine:
-			if activeSet.Len() == 0 {
-				return nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
-			}
-			top := activeSet.entries[0]
-			if top.VersionID() == v || g.IsAncestorOf(top.VersionID(), v) && top.Type == InstrBeginInsert {
+			if delta.Action == Insert {
 				delta.Items = append(delta.Items, instr.Line())
+			} else {
+				if enabledVersions.Len() == 0 {
+					return nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
+				}
+				top := enabledVersions.entries[0]
+				if activeSet[top.VersionID()] && top.Type == InstrBeginInsert {
+					delta.Items = append(delta.Items, instr.Line())
+				}
 			}
 		case InstrBeginInsert:
-			heap.Push(activeSet, instr)
 			if instr.VersionID() == v {
 				if len(delta.Items) > 0 {
 					deltas = append(deltas, delta)
 				}
 				delta.Action = Insert
 				delta.Items = nil
+			} else {
+				heap.Push(enabledVersions, instr)
 			}
 		case InstrBeginDelete:
 			if instr.VersionID() == v {
@@ -335,22 +340,24 @@ func ReconstructDelta(instructions []Instruction, g VersionGraph, v VersionID) (
 				}
 				delta.Action = Delete
 				delta.Items = nil
-			}
-			if g.IsAncestorOf(instr.VersionID(), v) {
-				heap.Push(activeSet, instr)
+			} else if activeSet[instr.VersionID()] {
+				heap.Push(enabledVersions, instr)
 			} else {
-				heap.Push(inactiveSet, instr)
+				heap.Push(inactiveVersions, instr)
 			}
 		case InstrEnd:
-			top, err := activeSet.closeInstr(instr.VersionID())
-			if top.VersionID() == v && len(delta.Items) > 0 {
-				deltas = append(deltas, delta)
+			if instr.VersionID() == v {
+				if len(delta.Items) > 0 {
+					deltas = append(deltas, delta)
+				}
 				delta.Action = Keep
 				delta.Items = nil
-			}
-			if err != nil {
-				if _, err := inactiveSet.closeInstr(instr.VersionID()); err != nil {
-					return nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
+			} else {
+				_, err := enabledVersions.closeInstr(instr.VersionID())
+				if err != nil {
+					if _, err := inactiveVersions.closeInstr(instr.VersionID()); err != nil {
+						return nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
+					}
 				}
 			}
 		}
@@ -359,35 +366,6 @@ func ReconstructDelta(instructions []Instruction, g VersionGraph, v VersionID) (
 		deltas = append(deltas, delta)
 	}
 	return deltas, nil
-}
-
-type Table struct {
-	data []int
-	rows int
-	cols int
-}
-
-func NewTable(n, m int) Table {
-	return Table{make([]int, n*m), n, m}
-}
-
-func (t Table) At(i, j int) int {
-	return t.data[t.cols*i+j]
-}
-
-func (t Table) Set(i, j, v int) {
-	t.data[t.cols*i+j] = v
-}
-
-func (t Table) String() string {
-	var buf strings.Builder
-	for i := range t.rows {
-		for _, v := range t.data[t.cols*i : t.cols*(i+1)] {
-			fmt.Fprintf(&buf, "%3d", v)
-		}
-		buf.WriteRune('\n')
-	}
-	return buf.String()
 }
 
 func FormatScript(script []Delta) string {
@@ -414,22 +392,25 @@ func PrintScript(script []Delta) {
 func DiffScript(a, b []int) []Delta {
 	inf := 1<<32 - 1
 	n, m := len(a), len(b)
-	d := NewTable(n+1, m+1)
+	d := make([][]int, n+1)
+	for i := range d {
+		d[i] = make([]int, m+1)
+	}
 
 	for i := range n + 1 {
-		d.Set(i, m, n-i)
+		d[i][m] = n - i
 	}
 	for j := range m + 1 {
-		d.Set(n, j, m-j)
+		d[n][j] = m - j
 	}
 	for i := n - 1; i >= 0; i-- {
 		for j := m - 1; j >= 0; j-- {
 			v := inf
 			if a[i] == b[j] {
-				v = d.At(i+1, j+1)
+				v = d[i+1][j+1]
 			}
-			v = min(v, 1+min(d.At(i, j+1), d.At(i+1, j)))
-			d.Set(i, j, v)
+			v = min(v, 1+min(d[i][j+1], d[i+1][j]))
+			d[i][j] = v
 		}
 	}
 
@@ -440,19 +421,19 @@ func DiffScript(a, b []int) []Delta {
 		var delta Delta
 		dx, dy := 0, 0
 		if i < n && j < m && a[i] == b[j] {
-			v = d.At(i+1, j+1)
+			v = d[i+1][j+1]
 			delta.Items = []int{a[i]}
 			delta.Action = Keep
 			dx, dy = 1, 1
 		}
-		if i < n && d.At(i+1, j) < v {
-			v = d.At(i+1, j)
+		if i < n && d[i+1][j] < v {
+			v = d[i+1][j]
 			delta.Action = Delete
 			delta.Items = []int{a[i]}
 			dx, dy = 1, 0
 		}
-		if j < m && d.At(i, j+1) < v {
-			v = d.At(i, j+1)
+		if j < m && d[i][j+1] < v {
+			v = d[i][j+1]
 			delta.Action = Insert
 			delta.Items = []int{b[j]}
 			dx, dy = 0, 1
@@ -562,6 +543,12 @@ func FormatUnifiedDiff(w io.Writer, filename string, deltas []Delta, lines []str
 	}
 	return nil
 }
+
+// Next steps:
+// - [ ] Add support for version graphs.
+// - [ ] Implement serialization/deserialization for weave files.
+// - [ ] Implement basic commands.
+// - [ ] Implement automatic merge (hard).
 
 func main() {
 	script := DiffScript([]int{4, 1, 8, 8, 8, 1, 2, 3, 4}, []int{4, 9, 8, 1, 2, 3, 5})
