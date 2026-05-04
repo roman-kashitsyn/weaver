@@ -149,6 +149,14 @@ func (s *StringPool) Lines() []string {
 
 type ActiveSet []bool
 
+func (s ActiveSet) Contains(v VersionID) bool {
+	if v < 0 {
+		return false
+	}
+	i := int(v)
+	return i < len(s) && s[i]
+}
+
 // === Priority queue for deltas.
 
 // instructionQueue is a priority queue for weave instructions.
@@ -193,43 +201,136 @@ func (q *instructionQueue) closeInstr(v VersionID) (Instruction, error) {
 	return heap.Remove(q, i).(Instruction), nil
 }
 
+type weaveScanner struct {
+	activeSet ActiveSet
+	active    *instructionQueue
+	open      map[VersionID]openSpan
+}
+
+type openSpan struct {
+	instr         Instruction
+	inActiveQueue bool
+	line          int
+}
+
+func newWeaveScanner(activeSet ActiveSet) *weaveScanner {
+	return &weaveScanner{
+		activeSet: activeSet,
+		active:    NewQueue(),
+		open:      make(map[VersionID]openSpan),
+	}
+}
+
+func (s *weaveScanner) begin(instr Instruction, line int) error {
+	return s.beginSpan(instr, line, false)
+}
+
+func (s *weaveScanner) beginIgnored(instr Instruction, line int) error {
+	return s.beginSpan(instr, line, true)
+}
+
+func (s *weaveScanner) beginSpan(instr Instruction, line int, ignored bool) error {
+	v := instr.VersionID()
+	if previous, ok := s.open[v]; ok {
+		return fmt.Errorf("%w: duplicate beginning for version %d at line %d; previous beginning was at line %d",
+			ErrBadWeave, v, line, previous.line)
+	}
+
+	active := false
+	switch instr.Type {
+	case InstrBeginInsert:
+		active = !ignored
+	case InstrBeginDelete:
+		active = !ignored && s.activeSet.Contains(v)
+	default:
+		return fmt.Errorf("%w: unexpected beginning instruction %s at line %d", ErrBadWeave, instr, line)
+	}
+	if active {
+		heap.Push(s.active, instr)
+	}
+	s.open[v] = openSpan{
+		instr:         instr,
+		inActiveQueue: active,
+		line:          line,
+	}
+	return nil
+}
+
+func (s *weaveScanner) close(v VersionID, line int) error {
+	span, ok := s.open[v]
+	if !ok {
+		return fmt.Errorf("%w: no matching beginning for version %d at line %d", ErrBadWeave, v, line)
+	}
+	if span.inActiveQueue {
+		if _, err := s.active.closeInstr(v); err != nil {
+			return fmt.Errorf("%w: active span for version %d opened at line %d was missing from active queue at line %d",
+				err, v, span.line, line)
+		}
+	}
+	delete(s.open, v)
+	return nil
+}
+
+func (s *weaveScanner) lineVersion(line int) (VersionID, bool, error) {
+	if s.active.Len() == 0 {
+		return 0, false, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, line)
+	}
+	top := s.active.entries[0]
+	if s.activeSet.Contains(top.VersionID()) && top.Type == InstrBeginInsert {
+		return top.VersionID(), true, nil
+	}
+	return 0, false, nil
+}
+
+func (s *weaveScanner) finish() error {
+	if len(s.open) == 0 {
+		return nil
+	}
+	var span openSpan
+	first := true
+	for _, current := range s.open {
+		if first || current.line < span.line {
+			span = current
+			first = false
+		}
+	}
+	return fmt.Errorf("%w: unclosed instruction %s opened at line %d", ErrBadWeave, span.instr, span.line)
+}
+
 // Reconstruct locates the lines that belong to the given version.
 // It returns a mask that marks the "Line" instructions enabled for the given version
 // and the IDs of versions to which the enabled lines are attributed.
 //
 // Returns the [ErrBadWeave] if the instructions aren't a valid weave.
-func Reconstruct(instructions []Instruction, v VersionID, activeSet ActiveSet) ([]bool, []VersionID, error) {
+func Reconstruct(instructions []Instruction, activeSet ActiveSet) ([]bool, []VersionID, error) {
 	mask := make([]bool, len(instructions))
 	var versions []VersionID
-	enabledVersions := NewQueue()
-	disabledVersions := NewQueue()
+	scanner := newWeaveScanner(activeSet)
 	for i, instr := range instructions {
 		switch instr.Type {
 		case InstrLine:
-			if enabledVersions.Len() == 0 {
-				return nil, nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
+			version, ok, err := scanner.lineVersion(i)
+			if err != nil {
+				return nil, nil, err
 			}
-			top := enabledVersions.entries[0]
-			if activeSet[top.VersionID()] && top.Type == InstrBeginInsert {
+			if ok {
 				mask[i] = true
-				versions = append(versions, top.VersionID())
+				versions = append(versions, version)
 			}
-		case InstrBeginInsert:
-			heap.Push(enabledVersions, instr)
-		case InstrBeginDelete:
-			if activeSet[instr.VersionID()] {
-				heap.Push(enabledVersions, instr)
-			} else {
-				heap.Push(disabledVersions, instr)
+		case InstrBeginInsert, InstrBeginDelete:
+			if err := scanner.begin(instr, i); err != nil {
+				return nil, nil, err
 			}
 		case InstrEnd:
-			_, err := enabledVersions.closeInstr(instr.VersionID())
-			if err != nil {
-				if _, err := disabledVersions.closeInstr(instr.VersionID()); err != nil {
-					return nil, nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
-				}
+			if err := scanner.close(instr.VersionID(), i); err != nil {
+				return nil, nil, err
 			}
+		default:
+			return nil, nil, fmt.Errorf("%w: unknown instruction %s at %d", ErrBadWeave, instr, i)
 		}
+	}
+	if err := scanner.finish(); err != nil {
+		return nil, nil, err
 	}
 	return mask, versions, nil
 }
@@ -238,8 +339,8 @@ func Reconstruct(instructions []Instruction, v VersionID, activeSet ActiveSet) (
 //
 // Returns [ErrBadWeave] if the instructions aren't a valid weave.
 // Returns [ErrBadDelta] if the deltas don't apply to the weave cleanly.
-func Interleave(instructions []Instruction, deltas []Delta, activeSet ActiveSet, baseV, newV VersionID) ([]Instruction, error) {
-	mask, _, err := Reconstruct(instructions, baseV, activeSet)
+func Interleave(instructions []Instruction, deltas []Delta, activeSet ActiveSet, v VersionID) ([]Instruction, error) {
+	mask, _, err := Reconstruct(instructions, activeSet)
 	if err != nil {
 		return nil, err
 	}
@@ -255,13 +356,13 @@ func Interleave(instructions []Instruction, deltas []Delta, activeSet ActiveSet,
 			delta := deltas[j]
 			switch delta.Action {
 			case Insert:
-				out = append(out, Instruction{InstrBeginInsert, int(newV)})
+				out = append(out, Instruction{InstrBeginInsert, int(v)})
 				for _, item := range delta.Items {
 					out = append(out, Instruction{InstrLine, item})
 				}
-				out = append(out, Instruction{InstrEnd, int(newV)})
+				out = append(out, Instruction{InstrEnd, int(v)})
 			case Delete:
-				out = append(out, Instruction{InstrBeginDelete, int(newV)})
+				out = append(out, Instruction{InstrBeginDelete, int(v)})
 				skipped := 0
 				for skipped < len(delta.Items) {
 					if i >= n {
@@ -276,7 +377,7 @@ func Interleave(instructions []Instruction, deltas []Delta, activeSet ActiveSet,
 					}
 					i++
 				}
-				out = append(out, Instruction{InstrEnd, int(newV)})
+				out = append(out, Instruction{InstrEnd, int(v)})
 			case Keep:
 				skipped := 0
 				for skipped < len(delta.Items) {
@@ -295,7 +396,7 @@ func Interleave(instructions []Instruction, deltas []Delta, activeSet ActiveSet,
 			}
 			j++
 		} else if i < n {
-			return nil, fmt.Errorf("%w: delta does not cover all lines in base version %d", ErrBadDelta, baseV)
+			return nil, fmt.Errorf("%w: delta does not cover all lines in base", ErrBadDelta)
 		}
 
 	}
@@ -306,8 +407,7 @@ func Interleave(instructions []Instruction, deltas []Delta, activeSet ActiveSet,
 func ReconstructDelta(instructions []Instruction, v VersionID, activeSet ActiveSet) ([]Delta, error) {
 	var deltas []Delta
 	delta := Delta{Action: Keep, Items: nil}
-	enabledVersions := NewQueue()
-	inactiveVersions := NewQueue()
+	scanner := newWeaveScanner(activeSet)
 
 	for i, instr := range instructions {
 		switch instr.Type {
@@ -315,52 +415,61 @@ func ReconstructDelta(instructions []Instruction, v VersionID, activeSet ActiveS
 			if delta.Action == Insert {
 				delta.Items = append(delta.Items, instr.Line())
 			} else {
-				if enabledVersions.Len() == 0 {
-					return nil, fmt.Errorf("%w: bare line instruction on line %d", ErrBadWeave, i)
+				_, ok, err := scanner.lineVersion(i)
+				if err != nil {
+					return nil, err
 				}
-				top := enabledVersions.entries[0]
-				if activeSet[top.VersionID()] && top.Type == InstrBeginInsert {
+				if ok {
 					delta.Items = append(delta.Items, instr.Line())
 				}
 			}
 		case InstrBeginInsert:
 			if instr.VersionID() == v {
+				if err := scanner.beginIgnored(instr, i); err != nil {
+					return nil, err
+				}
 				if len(delta.Items) > 0 {
 					deltas = append(deltas, delta)
 				}
 				delta.Action = Insert
 				delta.Items = nil
 			} else {
-				heap.Push(enabledVersions, instr)
+				if err := scanner.begin(instr, i); err != nil {
+					return nil, err
+				}
 			}
 		case InstrBeginDelete:
 			if instr.VersionID() == v {
+				if err := scanner.beginIgnored(instr, i); err != nil {
+					return nil, err
+				}
 				if len(delta.Items) > 0 {
 					deltas = append(deltas, delta)
 				}
 				delta.Action = Delete
 				delta.Items = nil
-			} else if activeSet[instr.VersionID()] {
-				heap.Push(enabledVersions, instr)
 			} else {
-				heap.Push(inactiveVersions, instr)
+				if err := scanner.begin(instr, i); err != nil {
+					return nil, err
+				}
 			}
 		case InstrEnd:
+			if err := scanner.close(instr.VersionID(), i); err != nil {
+				return nil, err
+			}
 			if instr.VersionID() == v {
 				if len(delta.Items) > 0 {
 					deltas = append(deltas, delta)
 				}
 				delta.Action = Keep
 				delta.Items = nil
-			} else {
-				_, err := enabledVersions.closeInstr(instr.VersionID())
-				if err != nil {
-					if _, err := inactiveVersions.closeInstr(instr.VersionID()); err != nil {
-						return nil, fmt.Errorf("%w: no matching beginning for instruction %s at %d", err, instr, i)
-					}
-				}
 			}
+		default:
+			return nil, fmt.Errorf("%w: unknown instruction %s at %d", ErrBadWeave, instr, i)
 		}
+	}
+	if err := scanner.finish(); err != nil {
+		return nil, err
 	}
 	if len(delta.Items) > 0 {
 		deltas = append(deltas, delta)
