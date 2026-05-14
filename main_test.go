@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -170,10 +172,10 @@ func TestReconstructErrors(t *testing.T) {
 		weave   string
 		wantMsg string
 	}{
-		{"bare line", "1\n", "line 0"},
-		{"unmatched end", "^AE 1\n", "line 0"},
-		{"unclosed insert", "^AI 1\n1\n", "opened at line 0"},
-		{"duplicate begin", "^AI 1\n^AD 1\n1\n^AE 1\n^AE 1\n", "previous beginning was at line 0"},
+		{"bare line", "1\n", "offset 0"},
+		{"unmatched end", "^AE 1\n", "offset 0"},
+		{"unclosed insert", "^AI 1\n1\n", "opened at offset 0"},
+		{"duplicate begin", "^AI 1\n^AD 1\n1\n^AE 1\n^AE 1\n", "previous beginning was at offset 0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -232,8 +234,8 @@ func TestReconstructDeltaErrorsOnUnclosedTargetSpan(t *testing.T) {
 	if !errors.Is(err, ErrBadWeave) {
 		t.Fatalf("got %v, want ErrBadWeave", err)
 	}
-	if !strings.Contains(err.Error(), "opened at line 0") {
-		t.Fatalf("got %q, want message containing opening line", err)
+	if !strings.Contains(err.Error(), "opened at offset 0") {
+		t.Fatalf("got %q, want message containing opening offset", err)
 	}
 }
 
@@ -1080,6 +1082,89 @@ func TestUnifiedDiff(t *testing.T) {
 	}
 }
 
+func TestFileLinesTrimsOnlyOneFinalNewline(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "lines.txt")
+	if err := os.WriteFile(file, []byte("one\n\n"), 0o644); err != nil {
+		t.Fatalf("write file: %s", err)
+	}
+	got, err := fileLines(file)
+	if err != nil {
+		t.Fatalf("fileLines: %s", err)
+	}
+	want := []string{"one", ""}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestVersionParentsMustBeOlderThanChild(t *testing.T) {
+	weave := &Weave{
+		Versions: []Version{
+			{ID: 1},
+			{ID: 2, Parents: []VersionID{2}},
+		},
+	}
+	if err := validateVersionParents(weave); err == nil {
+		t.Fatal("expected parent validation error")
+	}
+}
+
+func TestVersionCanHaveMultipleParents(t *testing.T) {
+	weave := &Weave{
+		Head: 4,
+		Versions: []Version{
+			{ID: 1, Description: "base"},
+			{ID: 2, Parents: []VersionID{1}, Description: "left"},
+			{ID: 3, Parents: []VersionID{1}, Description: "right"},
+			{ID: 4, Parents: []VersionID{2, 3}, Description: "merge"},
+		},
+	}
+	if err := validateVersionParents(weave); err != nil {
+		t.Fatalf("validateVersionParents: %s", err)
+	}
+	activeSet := activeSetForVersion(weave.Versions, 4)
+	for _, version := range []VersionID{1, 2, 3, 4} {
+		if !activeSet.Contains(version) {
+			t.Fatalf("version %d is not active in %v", version, activeSet)
+		}
+	}
+}
+
+func TestReconstructDeltaIgnoresDescendantInsert(t *testing.T) {
+	as := func(ancestors ...int) ActiveSet {
+		return makeActiveSet(ancestors, 3)
+	}
+	interleave := func(weave []Instruction, deltaStr string, activeSet ActiveSet, newV int) []Instruction {
+		t.Helper()
+		deltas, err := parseDeltas(deltaStr)
+		if err != nil {
+			t.Fatalf("parse deltas for v%d: %s", newV, err)
+		}
+		result, err := Interleave(weave, deltas, activeSet, VersionID(newV))
+		if err != nil {
+			t.Fatalf("interleave v%d: %s", newV, err)
+		}
+		return result
+	}
+
+	weave := interleave(nil, "+ 1\n+ 3\n", as(0, 1), 1)
+	weave = interleave(weave, "  1\n+ 2\n  3\n", as(0, 1, 2), 2)
+	weave = interleave(weave, "  1\n  2\n+ 4\n  3\n", as(0, 1, 2, 3), 3)
+
+	got, err := ReconstructDelta(weave, 2, as(0, 1, 2))
+	if err != nil {
+		t.Fatalf("ReconstructDelta: %s", err)
+	}
+	want, err := parseDeltas("  1\n+ 2\n  3\n")
+	if err != nil {
+		t.Fatalf("parse expected deltas: %s", err)
+	}
+	if !slices.EqualFunc(got, want, EqualDeltas) {
+		t.Fatalf("got:\n%swant:\n%s", FormatScript(got), FormatScript(want))
+	}
+}
+
 func makeActiveSet(ancestors []int, maxVersion int) ActiveSet {
 	as := make(ActiveSet, maxVersion+1)
 	for _, v := range ancestors {
@@ -1413,4 +1498,20 @@ func TestNonLinearInsertAtDeletedPosition(t *testing.T) {
 		checkDelta("v2", 2, []int{0, 1, 2}, "  1\n- 2\n+ 20\n  3\n")
 		checkDelta("v3", 3, []int{0, 1, 3}, "  1\n- 2\n  3\n")
 	})
+}
+
+func TestCram(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join("testdata", "cram", "*.t"))
+	if err != nil {
+		t.Fatalf("glob cram tests: %s", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no cram tests found")
+	}
+	for _, file := range files {
+		name := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+		t.Run(name, func(t *testing.T) {
+			runCramFile(t, file)
+		})
+	}
 }
