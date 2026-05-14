@@ -42,10 +42,10 @@ The show command can reconstruct an explicit version and the current head.
 The log command walks backward from the head.
 
   $ sfvc log note.txt
-  @  v2   tester
+  @  v2   tester     2001-02-03 04:05:06 +0000
   │  replace two
   │
-  *  v1   tester
+  *  v1   tester     2001-02-03 04:05:06 +0000
   │  first
   │
   ~

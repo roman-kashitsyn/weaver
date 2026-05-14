@@ -41,10 +41,10 @@ Each version should reconstruct its own contents.
 The log command follows only the current head ancestry, so sibling v2 is not shown here.
 
   $ sfvc log branch.txt
-  @  v3   tester
+  @  v3   tester     2001-02-03 04:05:06 +0000
   │  branch from v1
   │
-  *  v1   tester
+  *  v1   tester     2001-02-03 04:05:06 +0000
   │  base
   │
   ~
@@ -53,13 +53,13 @@ TODO: display branches correctly.
 The --all view shows the complete flat history so the user can discover other versions to check out.
 
   $ sfvc log --all branch.txt
-  @  v3   tester
+  @  v3   tester     2001-02-03 04:05:06 +0000
   │  branch from v1
   │
-  *  v2   tester
+  *  v2   tester     2001-02-03 04:05:06 +0000
   │  v2 change
   │
-  *  v1   tester
+  *  v1   tester     2001-02-03 04:05:06 +0000
   │  base
   │
   ~

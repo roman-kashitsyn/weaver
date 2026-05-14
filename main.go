@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"os"
-	osuser "os/user"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -37,14 +37,22 @@ func EqualDeltas(x, y Delta) bool {
 	return x.Action == y.Action && slices.Equal(x.Items, y.Items)
 }
 
+func appendDelta(script []Delta, action Action, item int) []Delta {
+	n := len(script)
+	if n > 0 && script[n-1].Action == action {
+		script[n-1].Items = append(script[n-1].Items, item)
+		return script
+	}
+	return append(script, Delta{Action: action, Items: []int{item}})
+}
+
 type InstructionType int
 
 const (
-	InstrUnknown InstructionType = iota
-	InstrLine
-	InstrBeginInsert
-	InstrBeginDelete
-	InstrEnd
+	Line InstructionType = iota
+	BeginInsert
+	BeginDelete
+	End
 )
 
 // Instruction is a weave instruction.
@@ -66,13 +74,13 @@ func (i Instruction) VersionID() VersionID {
 
 func (i Instruction) String() string {
 	switch i.Type {
-	case InstrLine:
+	case Line:
 		return fmt.Sprintf("%d", i.Payload)
-	case InstrBeginInsert:
+	case BeginInsert:
 		return fmt.Sprintf("^AI %d", i.Payload)
-	case InstrBeginDelete:
+	case BeginDelete:
 		return fmt.Sprintf("^AD %d", i.Payload)
-	case InstrEnd:
+	case End:
 		return fmt.Sprintf("^AE %d", i.Payload)
 	}
 	return "unknown"
@@ -94,6 +102,7 @@ type Version struct {
 	Parents     []VersionID
 	Author      string
 	Description string
+	Date        time.Time
 }
 
 type Weave struct {
@@ -171,56 +180,56 @@ func Reconstruct(
 	instructions []Instruction,
 	activeSet ActiveSet,
 ) (mask []bool, versions []VersionID, err error) {
-	// activeQueue is the priority queue of active open blocks.
-	var activeQueue []Instruction
-	topActive := func() Instruction {
-		return slices.MaxFunc(activeQueue, func(l, r Instruction) int {
-			return cmp.Compare(l.VersionID(), r.VersionID())
-		})
-	}
-	openBlocksByVersion := make(map[VersionID]int)
+
 	mask = make([]bool, len(instructions))
+	openBlocksByVersion := make(map[VersionID]int)
+	// activeBlocks are sorted by VersionID (ascending).
+	var activeBlocks []Instruction
+	activeBlock := func(v VersionID) (int, bool) {
+		return slices.BinarySearchFunc(activeBlocks, v,
+			func(a Instruction, target VersionID) int {
+				return cmp.Compare(a.VersionID(), target)
+			})
+	}
 
 	for offset, instr := range instructions {
 		switch instr.Type {
-		case InstrLine:
-			if len(activeQueue) == 0 {
-				return nil, nil, fmt.Errorf("%w: bare line instruction at offset %d", ErrBadWeave, offset)
+		case Line:
+			if len(activeBlocks) == 0 {
+				return nil, nil, ErrBadWeave
 			}
-			top := topActive()
-			if activeSet.Contains(top.VersionID()) && top.Type == InstrBeginInsert {
+			top := activeBlocks[len(activeBlocks)-1]
+			v := top.VersionID()
+			if activeSet.Contains(v) && top.Type == BeginInsert {
 				mask[offset] = true
-				versions = append(versions, top.VersionID())
+				versions = append(versions, v)
 			}
-		case InstrBeginInsert, InstrBeginDelete:
+		case BeginInsert, BeginDelete:
 			v := instr.VersionID()
-			if previous, ok := openBlocksByVersion[v]; ok {
-				return nil, nil, fmt.Errorf("%w: nested block for version %d at offset %d; previous beginning was at offset %d",
-					ErrBadWeave, v, offset, previous)
+			if _, ok := openBlocksByVersion[v]; ok {
+				return nil, nil, ErrBadWeave
 			}
-			if instr.Type == InstrBeginInsert || activeSet.Contains(v) {
-				activeQueue = append(activeQueue, instr)
+			if instr.Type == BeginInsert || activeSet.Contains(v) {
+				at, _ := activeBlock(v)
+				activeBlocks = slices.Insert(activeBlocks, at, instr)
 			}
 			openBlocksByVersion[v] = offset
-		case InstrEnd:
+		case End:
 			v := instr.VersionID()
 			if _, ok := openBlocksByVersion[v]; !ok {
-				return nil, nil, fmt.Errorf("%w: no matching beginning for version %d at offset %d", ErrBadWeave, v, offset)
+				return nil, nil, ErrBadWeave
 			}
-			delIndex := slices.IndexFunc(activeQueue, func(instr Instruction) bool {
-				return instr.VersionID() == v
-			})
-			if delIndex >= 0 {
-				activeQueue = slices.Delete(activeQueue, delIndex, delIndex+1)
+			at, found := activeBlock(v)
+			if found {
+				activeBlocks = slices.Delete(activeBlocks, at, at+1)
 			}
 			delete(openBlocksByVersion, v)
 		default:
-			return nil, nil, fmt.Errorf("%w: unknown instruction %s at offset %d", ErrBadWeave, instr, offset)
+			return nil, nil, ErrBadWeave
 		}
 	}
 	if len(openBlocksByVersion) > 0 {
-		firstOpen := slices.Min(slices.Collect(maps.Values(openBlocksByVersion)))
-		return nil, nil, fmt.Errorf("%w: unclosed instruction %s opened at offset %d", ErrBadWeave, instructions[firstOpen], firstOpen)
+		return nil, nil, ErrBadWeave
 	}
 	return mask, versions, nil
 }
@@ -228,115 +237,98 @@ func Reconstruct(
 // Interleave extends a weave with a new delta.
 //
 // Returns [ErrBadWeave] if the instructions aren't a valid weave.
-// Returns [ErrBadDelta] if the deltas don't apply to the weave cleanly.
+// Returns [ErrBadDelta] if the deltas don't apply cleanly.
 func Interleave(
 	instructions []Instruction,
-	deltas []Delta,
 	activeSet ActiveSet,
+	deltas []Delta,
 	v VersionID,
-) (result []Instruction, err error) {
+) (out []Instruction, err error) {
 	mask, _, err := Reconstruct(instructions, activeSet)
 	if err != nil {
 		return nil, err
 	}
+
 	i, j, n, m := 0, 0, len(instructions), len(deltas)
+
+	// consumeLines outputs instructions until it sees all expected lines in order.
+	consumeLines := func(expected []int) error {
+		skipped := 0
+		for skipped < len(expected) {
+			if i >= n {
+				return ErrBadDelta
+			}
+			out = append(out, instructions[i])
+			if mask[i] {
+				if expected[skipped] != instructions[i].Line() {
+					return ErrBadDelta
+				}
+				skipped++
+			}
+			i++
+		}
+		return nil
+	}
+
 	for i < n || j < m {
-		// Advance to the next activated line.
 		for i < n && !mask[i] {
-			result = append(result, instructions[i])
+			out = append(out, instructions[i])
 			i++
 		}
 		if j < m {
 			delta := deltas[j]
 			switch delta.Action {
 			case Insert:
-				result = append(result, Instruction{InstrBeginInsert, int(v)})
+				out = append(out, Instruction{BeginInsert, int(v)})
 				for _, item := range delta.Items {
-					result = append(result, Instruction{InstrLine, item})
+					out = append(out, Instruction{Line, item})
 				}
-				result = append(result, Instruction{InstrEnd, int(v)})
+				out = append(out, Instruction{End, int(v)})
 			case Delete:
-				result = append(result, Instruction{InstrBeginDelete, int(v)})
-				skipped := 0
-				for skipped < len(delta.Items) {
-					if i >= n {
-						return nil, fmt.Errorf("%w: bad deletion at %d", ErrBadDelta, j)
-					}
-					result = append(result, instructions[i])
-					if mask[i] {
-						if delta.Items[skipped] != instructions[i].Line() {
-							return nil, fmt.Errorf("%w: mismatched line %d in hunk %d", ErrBadDelta, skipped+1, j+1)
-						}
-						skipped++
-					}
-					i++
+				out = append(out, Instruction{BeginDelete, int(v)})
+				if err := consumeLines(delta.Items); err != nil {
+					return nil, err
 				}
-				result = append(result, Instruction{InstrEnd, int(v)})
+				out = append(out, Instruction{End, int(v)})
 			case Keep:
-				skipped := 0
-				for skipped < len(delta.Items) {
-					if i >= n {
-						return nil, ErrBadDelta
-					}
-					result = append(result, instructions[i])
-					if mask[i] {
-						if delta.Items[skipped] != instructions[i].Line() {
-							return nil, fmt.Errorf("%w: mismatched line %d in hunk %d", ErrBadDelta, skipped+1, j+1)
-						}
-						skipped++
-					}
-					i++
+				if err := consumeLines(delta.Items); err != nil {
+					return nil, err
 				}
 			}
 			j++
 		} else if i < n {
-			return nil, fmt.Errorf("%w: delta does not cover all lines in base", ErrBadDelta)
+			return nil, ErrBadDelta
 		}
-
 	}
-	return result, nil
+	return out, nil
 }
 
-// ReconstructDelta extracts from a weave the changes introduced by the specified version.
+// ReconstructDelta extracts the changes between two active version sets.
 func ReconstructDelta(
 	instructions []Instruction,
-	v VersionID,
-	activeSet ActiveSet,
+	beforeSet, afterSet ActiveSet,
 ) (deltas []Delta, err error) {
-	before, _, err := Reconstruct(instructions, activeSet.Disactivate(v))
+	before, _, err := Reconstruct(instructions, beforeSet)
 	if err != nil {
 		return nil, err
 	}
-	after, _, err := Reconstruct(instructions, activeSet.Activate(v))
+	after, _, err := Reconstruct(instructions, afterSet)
 	if err != nil {
 		return nil, err
-	}
-
-	var currentDelta Delta
-	emit := func(action Action, line int) {
-		if currentDelta.Action != action && len(currentDelta.Items) > 0 {
-			deltas = append(deltas, currentDelta)
-			currentDelta.Items = nil
-		}
-		currentDelta.Action = action
-		currentDelta.Items = append(currentDelta.Items, line)
 	}
 
 	for i, instr := range instructions {
-		if instr.Type != InstrLine {
+		if instr.Type != Line {
 			continue
 		}
 		switch {
 		case before[i] && after[i]:
-			emit(Keep, instr.Line())
+			deltas = appendDelta(deltas, Keep, instr.Line())
 		case !before[i] && after[i]:
-			emit(Insert, instr.Line())
+			deltas = appendDelta(deltas, Insert, instr.Line())
 		case before[i] && !after[i]:
-			emit(Delete, instr.Line())
+			deltas = appendDelta(deltas, Delete, instr.Line())
 		}
-	}
-	if len(currentDelta.Items) > 0 {
-		deltas = append(deltas, currentDelta)
 	}
 	return deltas, nil
 }
@@ -362,63 +354,39 @@ func PrintScript(script []Delta) {
 	fmt.Print(FormatScript(script))
 }
 
-func DiffScript(a, b []int) []Delta {
-	inf := 1<<32 - 1
+// DiffScript computes the delta between two sequences.
+func DiffScript(a, b []int) (script []Delta) {
 	n, m := len(a), len(b)
-	d := make([][]int, n+1)
-	for i := range d {
-		d[i] = make([]int, m+1)
-	}
 
-	for i := range n + 1 {
-		d[i][m] = n - i
+	// Build a table of lengths of longest common subsequences of a and b.
+	lcs := make([][]int, n+1)
+	for i := range lcs {
+		lcs[i] = make([]int, m+1)
 	}
-	for j := range m + 1 {
-		d[n][j] = m - j
-	}
-	for i := n - 1; i >= 0; i-- {
-		for j := m - 1; j >= 0; j-- {
-			v := inf
+	for i := range slices.Backward(a) {
+		for j := range slices.Backward(b) {
 			if a[i] == b[j] {
-				v = d[i+1][j+1]
+				lcs[i][j] = 1 + lcs[i+1][j+1]
+			} else {
+				lcs[i][j] = max(lcs[i+1][j], lcs[i][j+1])
 			}
-			v = min(v, 1+min(d[i][j+1], d[i+1][j]))
-			d[i][j] = v
 		}
 	}
 
-	var script []Delta
-	i, j := 0, 0
-	for i < n || j < m {
-		v := inf
-		var delta Delta
-		dx, dy := 0, 0
-		if i < n && j < m && a[i] == b[j] {
-			v = d[i+1][j+1]
-			delta.Items = []int{a[i]}
-			delta.Action = Keep
-			dx, dy = 1, 1
+	// Traverse the LCS table and reconstruct the optimal edits.
+	for i, j := 0, 0; i < n || j < m; {
+		switch {
+		case i < n && j < m && a[i] == b[j]:
+			script = appendDelta(script, Keep, a[i])
+			i++
+			j++
+		case i < n && (j == m || lcs[i+1][j] >= lcs[i][j+1]):
+			script = appendDelta(script, Delete, a[i])
+			i++
+		default:
+			script = appendDelta(script, Insert, b[j])
+			j++
 		}
-		if i < n && d[i+1][j] < v {
-			v = d[i+1][j]
-			delta.Action = Delete
-			delta.Items = []int{a[i]}
-			dx, dy = 1, 0
-		}
-		if j < m && d[i][j+1] < v {
-			v = d[i][j+1]
-			delta.Action = Insert
-			delta.Items = []int{b[j]}
-			dx, dy = 0, 1
-		}
-		k := len(script)
-		if k > 0 && script[k-1].Action == delta.Action {
-			script[k-1].Items = append(script[k-1].Items, delta.Items[0])
-		} else {
-			script = append(script, delta)
-		}
-		i += dx
-		j += dy
 	}
 
 	return script
@@ -594,18 +562,23 @@ func runInit(args []string, stdout io.Writer) error {
 	lineIDs := internLines(pool, lines)
 	instructions := make([]Instruction, 0, len(lineIDs)+2)
 	if len(lineIDs) > 0 {
-		instructions = append(instructions, Instruction{InstrBeginInsert, 1})
+		instructions = append(instructions, Instruction{BeginInsert, 1})
 		for _, lineID := range lineIDs {
-			instructions = append(instructions, Instruction{InstrLine, lineID})
+			instructions = append(instructions, Instruction{Line, lineID})
 		}
-		instructions = append(instructions, Instruction{InstrEnd, 1})
+		instructions = append(instructions, Instruction{End, 1})
 	}
 
+	date, err := currentDate()
+	if err != nil {
+		return err
+	}
 	weave := &Weave{
 		Head:         1,
 		Instructions: instructions,
 		Versions: []Version{{
 			ID:          1,
+			Date:        date,
 			Author:      currentAuthor(),
 			Description: message,
 		}},
@@ -648,10 +621,14 @@ func runCommit(args []string, stdout io.Writer) error {
 		return nil
 	}
 
+	date, err := currentDate()
+	if err != nil {
+		return err
+	}
 	parent := weave.Head
 	newVersion := nextVersionID(weave)
 	activeSet := activeSetForVersion(weave.Versions, parent)
-	instructions, err := Interleave(weave.Instructions, deltas, activeSet, newVersion)
+	instructions, err := Interleave(weave.Instructions, activeSet, deltas, newVersion)
 	if err != nil {
 		return err
 	}
@@ -661,6 +638,7 @@ func runCommit(args []string, stdout io.Writer) error {
 	weave.Versions = append(weave.Versions, Version{
 		ID:          newVersion,
 		Parents:     []VersionID{parent},
+		Date:        date,
 		Author:      currentAuthor(),
 		Description: message,
 	})
@@ -864,7 +842,7 @@ func formatLogEntries(w io.Writer, weave *Weave, versions []Version) {
 			author = "<unknown>"
 		}
 		versionStr := fmt.Sprintf("v%d", version.ID)
-		fmt.Fprintf(w, "%s  %-4s %s\n", marker, versionStr, author)
+		fmt.Fprintf(w, "%s  %-4s %-10s %s\n", marker, versionStr, author, version.Date.Format("2006-01-02 15:04:05 -0700"))
 		fmt.Fprintf(w, "│  %s\n", firstLine)
 		fmt.Fprintf(w, "│\n")
 	}
@@ -904,7 +882,7 @@ func highestVersionID(weave *Weave) VersionID {
 	}
 	for _, instr := range weave.Instructions {
 		switch instr.Type {
-		case InstrBeginInsert, InstrBeginDelete, InstrEnd:
+		case BeginInsert, BeginDelete, End:
 			result = max(result, instr.VersionID())
 		}
 	}
@@ -999,11 +977,22 @@ func currentAuthor() string {
 	if author := os.Getenv("SFVC_AUTHOR"); author != "" {
 		return author
 	}
-	current, err := osuser.Current()
+	current, err := user.Current()
 	if err == nil && current.Username != "" {
 		return current.Username
 	}
 	return "unknown"
+}
+
+func currentDate() (time.Time, error) {
+	if date := os.Getenv("SFVC_DATE"); date != "" {
+		t, err := time.Parse(time.RFC3339, date)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("invalid SFVC_DATE: %w", err)
+		}
+		return t, nil
+	}
+	return time.Now(), nil
 }
 
 func extractMessage(args []string, defaultMessage string) ([]string, string, error) {

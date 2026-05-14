@@ -70,7 +70,7 @@ func checkReconstruct(t *testing.T, spec string, v VersionID) {
 			default:
 				t.Fatalf("unexpected marker %c on line %s", mark, line)
 			}
-			instructions = append(instructions, Instruction{InstrLine, p})
+			instructions = append(instructions, Instruction{Line, p})
 			continue
 		}
 		_, err = fmt.Sscanf(line, "  %s %d", &cmd, &p)
@@ -80,11 +80,11 @@ func checkReconstruct(t *testing.T, spec string, v VersionID) {
 			instr.Payload = p
 			switch cmd {
 			case "^AI":
-				instr.Type = InstrBeginInsert
+				instr.Type = BeginInsert
 			case "^AD":
-				instr.Type = InstrBeginDelete
+				instr.Type = BeginDelete
 			case "^AE":
-				instr.Type = InstrEnd
+				instr.Type = End
 			default:
 				t.Fatalf("unsupported instruction: %s", line)
 			}
@@ -168,14 +168,13 @@ func TestReconstruct(t *testing.T) {
 
 func TestReconstructErrors(t *testing.T) {
 	tests := []struct {
-		name    string
-		weave   string
-		wantMsg string
+		name  string
+		weave string
 	}{
-		{"bare line", "1\n", "offset 0"},
-		{"unmatched end", "^AE 1\n", "offset 0"},
-		{"unclosed insert", "^AI 1\n1\n", "opened at offset 0"},
-		{"duplicate begin", "^AI 1\n^AD 1\n1\n^AE 1\n^AE 1\n", "previous beginning was at offset 0"},
+		{"bare line", "1\n"},
+		{"unmatched end", "^AE 1\n"},
+		{"unclosed insert", "^AI 1\n1\n"},
+		{"duplicate begin", "^AI 1\n^AD 1\n1\n^AE 1\n^AE 1\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -186,9 +185,6 @@ func TestReconstructErrors(t *testing.T) {
 			_, _, err = Reconstruct(instructions, linearActiveSet(2, versionCount(instructions)))
 			if !errors.Is(err, ErrBadWeave) {
 				t.Fatalf("got %v, want ErrBadWeave", err)
-			}
-			if !strings.Contains(err.Error(), tt.wantMsg) {
-				t.Fatalf("got %q, want message containing %q", err, tt.wantMsg)
 			}
 		})
 	}
@@ -230,12 +226,10 @@ func TestReconstructDeltaErrorsOnUnclosedTargetSpan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse weave: %s", err)
 	}
-	_, err = ReconstructDelta(weave, 1, linearActiveSet(1, versionCount(weave)))
+	activeSet := linearActiveSet(1, versionCount(weave))
+	_, err = ReconstructDelta(weave, activeSet.Disactivate(1), activeSet.Activate(1))
 	if !errors.Is(err, ErrBadWeave) {
 		t.Fatalf("got %v, want ErrBadWeave", err)
-	}
-	if !strings.Contains(err.Error(), "opened at offset 0") {
-		t.Fatalf("got %q, want message containing opening offset", err)
 	}
 }
 
@@ -316,7 +310,7 @@ func versionCount(weave []Instruction) int {
 	result := 0
 	for _, instr := range weave {
 		switch instr.Type {
-		case InstrBeginInsert, InstrBeginDelete:
+		case BeginInsert, BeginDelete:
 			result = max(result, instr.Payload)
 
 		}
@@ -337,7 +331,7 @@ func parseWeave(s string) ([]Instruction, error) {
 		var payload int
 		_, err := fmt.Sscanf(line, "%d", &payload)
 		if err == nil {
-			instructions = append(instructions, Instruction{InstrLine, payload})
+			instructions = append(instructions, Instruction{Line, payload})
 			continue
 		}
 		_, err = fmt.Sscanf(line, "%s %d", &cmd, &payload)
@@ -348,11 +342,11 @@ func parseWeave(s string) ([]Instruction, error) {
 		instr.Payload = payload
 		switch cmd {
 		case "^AI":
-			instr.Type = InstrBeginInsert
+			instr.Type = BeginInsert
 		case "^AD":
-			instr.Type = InstrBeginDelete
+			instr.Type = BeginDelete
 		case "^AE":
-			instr.Type = InstrEnd
+			instr.Type = End
 		default:
 			return nil, fmt.Errorf("unsupported instruction on line %d: %s", lineNumber, cmd)
 		}
@@ -384,7 +378,7 @@ func checkInterleave(t *testing.T, baseStr, deltasStr, resultStr string, newV in
 	}
 	activeSet := linearActiveSet(VersionID(newV), versionCount(resultW))
 
-	interleaved, err := Interleave(baseW, deltas, activeSet, VersionID(newV))
+	interleaved, err := Interleave(baseW, activeSet, deltas, VersionID(newV))
 	if err != nil {
 		t.Fatalf("interleave failed: %s", err)
 	}
@@ -392,7 +386,8 @@ func checkInterleave(t *testing.T, baseStr, deltasStr, resultStr string, newV in
 		t.Fatalf("Expected:\n%sGot:\n%s", FormatWeave(resultW), FormatWeave(interleaved))
 	}
 
-	reconstructedDelta, err := ReconstructDelta(resultW, VersionID(newV), activeSet)
+	v := VersionID(newV)
+	reconstructedDelta, err := ReconstructDelta(resultW, activeSet.Disactivate(v), activeSet.Activate(v))
 	if !slices.EqualFunc(reconstructedDelta, deltas, EqualDeltas) {
 		t.Fatalf("delta reconstruction failed:\nExpected:\n%sGot:\n%s", FormatScript(deltas), FormatScript(reconstructedDelta))
 	}
@@ -797,7 +792,7 @@ func TestInterleaveErrors(t *testing.T) {
 				t.Fatalf("parse deltas: %s", err)
 			}
 			activeSet := linearActiveSet(VersionID(tt.newV), tt.newV)
-			_, err = Interleave(baseW, deltas, activeSet, VersionID(tt.newV))
+			_, err = Interleave(baseW, activeSet, deltas, VersionID(tt.newV))
 			if err == nil {
 				t.Fatal("expected an error, got nil")
 			}
@@ -1141,7 +1136,7 @@ func TestReconstructDeltaIgnoresDescendantInsert(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse deltas for v%d: %s", newV, err)
 		}
-		result, err := Interleave(weave, deltas, activeSet, VersionID(newV))
+		result, err := Interleave(weave, activeSet, deltas, VersionID(newV))
 		if err != nil {
 			t.Fatalf("interleave v%d: %s", newV, err)
 		}
@@ -1152,7 +1147,8 @@ func TestReconstructDeltaIgnoresDescendantInsert(t *testing.T) {
 	weave = interleave(weave, "  1\n+ 2\n  3\n", as(0, 1, 2), 2)
 	weave = interleave(weave, "  1\n  2\n+ 4\n  3\n", as(0, 1, 2, 3), 3)
 
-	got, err := ReconstructDelta(weave, 2, as(0, 1, 2))
+	activeSet := as(0, 1, 2)
+	got, err := ReconstructDelta(weave, activeSet.Disactivate(2), activeSet.Activate(2))
 	if err != nil {
 		t.Fatalf("ReconstructDelta: %s", err)
 	}
@@ -1203,7 +1199,7 @@ func TestNonLinearHistory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse deltas for v%d: %s", newV, err)
 		}
-		result, err := Interleave(weave, deltas, activeSet, VersionID(newV))
+		result, err := Interleave(weave, activeSet, deltas, VersionID(newV))
 		if err != nil {
 			t.Fatalf("interleave v%d: %s", newV, err)
 		}
@@ -1304,7 +1300,8 @@ func TestNonLinearHistory(t *testing.T) {
 				if err != nil {
 					t.Fatalf("parse expected deltas: %s", err)
 				}
-				got, err := ReconstructDelta(weave, v, as(ancestors...))
+				activeSet := as(ancestors...)
+				got, err := ReconstructDelta(weave, activeSet.Disactivate(v), activeSet.Activate(v))
 				if err != nil {
 					t.Fatalf("error: %s", err)
 				}
@@ -1337,7 +1334,7 @@ func TestNonLinearConflictingDeletes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse deltas for v%d: %s", newV, err)
 		}
-		result, err := Interleave(weave, deltas, activeSet, VersionID(newV))
+		result, err := Interleave(weave, activeSet, deltas, VersionID(newV))
 		if err != nil {
 			t.Fatalf("interleave v%d: %s", newV, err)
 		}
@@ -1394,7 +1391,8 @@ func TestNonLinearConflictingDeletes(t *testing.T) {
 				if err != nil {
 					t.Fatalf("parse expected deltas: %s", err)
 				}
-				got, err := ReconstructDelta(weave, v, as(ancestors...))
+				activeSet := as(ancestors...)
+				got, err := ReconstructDelta(weave, activeSet.Disactivate(v), activeSet.Activate(v))
 				if err != nil {
 					t.Fatalf("error: %s", err)
 				}
@@ -1425,7 +1423,7 @@ func TestNonLinearInsertAtDeletedPosition(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse deltas for v%d: %s", newV, err)
 		}
-		result, err := Interleave(weave, deltas, activeSet, VersionID(newV))
+		result, err := Interleave(weave, activeSet, deltas, VersionID(newV))
 		if err != nil {
 			t.Fatalf("interleave v%d: %s", newV, err)
 		}
@@ -1486,7 +1484,8 @@ func TestNonLinearInsertAtDeletedPosition(t *testing.T) {
 				if err != nil {
 					t.Fatalf("parse expected deltas: %s", err)
 				}
-				got, err := ReconstructDelta(weave, v, as(ancestors...))
+				activeSet := as(ancestors...)
+				got, err := ReconstructDelta(weave, activeSet.Disactivate(v), activeSet.Activate(v))
 				if err != nil {
 					t.Fatalf("error: %s", err)
 				}

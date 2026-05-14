@@ -46,6 +46,7 @@ func runCramFile(t *testing.T, file string) {
 		}
 	}()
 	t.Setenv("SFVC_AUTHOR", "tester")
+	t.Setenv("SFVC_DATE", "2001-02-03T04:05:06Z")
 
 	for _, command := range commands {
 		got, err := runCramCommand(command)
